@@ -2,7 +2,7 @@
   "name": "forticonnect-engine",
   "private": true,
   "license": "MIT",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "FortiConnect engine: VPN profiles, OpenConnect / strongSwan / Windows RAS tunnels and their prompts, behind a local HTTP + WebSocket API",
   "type": "module",
   "scripts": {

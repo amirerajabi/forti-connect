@@ -1,8 +1,19 @@
 # Status
 
-Released: 0.1.0 (tag v0.1.0, 2026-10-25), the first release, at https://github.com/amirerajabi/forti-connect. The release
-workflow built the Windows installer, the macOS DMG / ZIP and the Linux AppImage with their update metadata; the
-installer's SHA-512 matches `latest.yml`. No installed copy has updated from it yet (there is nothing older).
+Released: 0.1.1 (tag v0.1.1, 2026-10-25), at https://github.com/amirerajabi/forti-connect. Before it: 0.1.0, the first
+release, the same day. The release workflow builds the Windows installer, the macOS DMG / ZIP and the Linux AppImage
+with their update metadata (for 0.1.0 the installer's SHA-512 matched `latest.yml`). An installed 0.1.0 updating to
+0.1.1 has not been watched.
+
+## In 0.1.1
+
+- **SSL-VPN timed out after 60 s against a FortiGate with its own certificate** (reported with a real gateway that
+  FortiClient connects to). OpenConnect asks "Enter 'yes' to accept" on stdout, which Windows buffers while stdout is a
+  pipe, so the question never reached the engine. The engine now checks the certificate itself before starting
+  OpenConnect, asks the user, and passes `--servercert`; a changed certificate is flagged. Checked with OpenConnect 9.21
+  against that gateway up to its `Password:` prompt (not logged in), and with tests against a local self-signed server.
+- OpenConnect now runs with `--no-proxy`: it was following `HTTPS_PROXY` (here RayConnect's local proxy on 10819), so
+  the VPN would have broken whenever that app disconnected.
 
 ## Works (verified on Windows, 2026-10-25)
 

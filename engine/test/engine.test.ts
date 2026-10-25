@@ -3,12 +3,13 @@
 // what OpenConnect asks. Nothing here starts a real VPN, touches the network outside 127.0.0.1, or needs admin rights.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { X509Certificate } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as tls from 'node:tls';
 import { after, before, describe, test } from 'node:test';
-import type { Backends, EngineEvent, ProfileConfig } from '../../shared/protocol';
+import type { Backends, EngineEvent, Profile, ProfileConfig } from '../../shared/protocol';
 import { charonArgs, charonCommand, charonDialect, shellQuote } from '../src/core/backends/charon';
 import { ADMIN_PROMPT, openconnectArgs, openconnectDialect, parseVersion, withSudo } from '../src/core/backends/openconnect';
 import { ProcessTunnel } from '../src/core/backends/process';
@@ -123,9 +124,9 @@ describe('secrets', () => {
 describe('OpenConnect', () => {
   test('command line', () => {
     const args = openconnectArgs({ profile: normalizeConfig({ ...SSL, trustedCert: `pin-sha256:${'A'.repeat(43)}=` }), platform: 'win32', verbose: true, vpncScript: 'C:\\oc\\vpnc-script-win.js' });
-    assert.deepEqual(args, ['--protocol=fortinet', '--user', 'amir', '--servercert', `pin-sha256:${'A'.repeat(43)}=`, '--interface', 'FortiConnect', '--script', 'C:\\oc\\vpnc-script-win.js', '--verbose', 'https://vpn.example.com:10443/staff']);
+    assert.deepEqual(args, ['--protocol=fortinet', '--no-proxy', '--user', 'amir', '--servercert', `pin-sha256:${'A'.repeat(43)}=`, '--interface', 'FortiConnect', '--script', 'C:\\oc\\vpnc-script-win.js', '--verbose', 'https://vpn.example.com:10443/staff']);
     const mac = openconnectArgs({ profile: normalizeConfig({ ...SSL, realm: undefined, port: 443 }), platform: 'darwin', verbose: false, vpncScript: null });
-    assert.deepEqual(mac, ['--protocol=fortinet', '--user', 'amir', 'https://vpn.example.com:443']);
+    assert.deepEqual(mac, ['--protocol=fortinet', '--no-proxy', '--user', 'amir', 'https://vpn.example.com:443']);
   });
 
   test('sudo only where it is needed', () => {
@@ -238,22 +239,27 @@ const BACKENDS: Backends = {
   platform: 'linux',
 };
 
-async function fakeManager(mode: string, extra: { reconnect?: boolean } = {}) {
+async function fakeManager(mode: string, extra: { reconnect?: boolean; checkCertificates?: boolean } = {}) {
   const dir = tmpDir();
+  /** The profiles the tunnel was made for, as the backend saw them (with the certificate pin to pass on). */
+  const started: Profile[] = [];
   const m = new Manager(dir, {
     platform: 'linux',
     elevated: true,
     backends: BACKENDS,
     secretKey: KEY,
     reconnectDelays: [0.05],
-    tunnelFactory: (ctx) =>
-      new ProcessTunnel({ file: process.execPath, args: [FAKE_VPN, mode], username: ctx.profile.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: ['node'], stopSignal: 'SIGINT', connectTimeoutMs: 15_000 }),
+    checkCertificates: extra.checkCertificates ?? false,
+    tunnelFactory: (ctx) => {
+      started.push(ctx.profile);
+      return new ProcessTunnel({ file: process.execPath, args: [FAKE_VPN, mode], username: ctx.profile.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: ['node'], stopSignal: 'SIGINT', connectTimeoutMs: 15_000 });
+    },
   });
   await m.load();
   await m.updateSettings({ reconnect: extra.reconnect ?? false });
   const events: EngineEvent[] = [];
   m.on('event', (e: EngineEvent) => events.push(e));
-  return { m, dir, events };
+  return { m, dir, events, started };
 }
 
 /** Wait for the connection to ask something, and return the question. */
@@ -397,6 +403,68 @@ describe('Manager', () => {
     assert.ok(m.state().logs.some((l) => /left running by the last run/.test(l.text)));
     await m.shutdown();
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'runtime.json'), 'utf8')), {});
+  });
+});
+
+// OpenConnect on Windows asks about an untrusted certificate on stdout, which never reaches a pipe in time: the Manager
+// settles the certificate itself, before OpenConnect starts, against a local self-signed "FortiGate".
+describe('Manager: the gateway certificate before connecting', () => {
+  let server: tls.Server;
+  let port = 0;
+  const cert = fs.readFileSync(path.join(FIXTURES, 'gateway.crt'));
+  const pin = certPin(new X509Certificate(cert).raw);
+  before(async () => {
+    server = tls.createServer({ cert, key: fs.readFileSync(path.join(FIXTURES, 'gateway.key')) }, (s) => {
+      s.once('data', () => s.end('HTTP/1.1 200 OK\r\n\r\n/remote/login'));
+      s.on('error', () => undefined);
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    port = (server.address() as { port: number }).port;
+  });
+  after(() => server.close());
+
+  test('an untrusted certificate is asked about first, and its pin goes to OpenConnect', async () => {
+    const { m, started } = await fakeManager('ok', { checkCertificates: true });
+    const p = m.addProfile({ name: 'Office', type: 'ssl', gateway: '127.0.0.1', port, username: 'amir', savePassword: true, password: 'secret' });
+    const connecting = m.connect(p.id);
+    const q = await nextPrompt(m);
+    assert.equal(q.kind, 'cert');
+    assert.equal(q.detail, pin);
+    assert.match(q.message, /not trusted by this computer \(issued to "fortigate\.test"\)/);
+    assert.equal(started.length, 0, 'OpenConnect must not start before the certificate is settled');
+    m.answer(q.id, 'yes');
+    m.answer((await nextPrompt(m)).id, '123456');
+    assert.equal((await connecting).status, 'connected');
+    assert.equal(started[0].trustedCert, pin);
+    assert.equal(m.getProfile(p.id)!.trustedCert, pin);
+    await m.shutdown();
+  });
+
+  test('a pinned certificate connects without asking', async () => {
+    const { m } = await fakeManager('ok', { checkCertificates: true });
+    const p = m.addProfile({ name: 'Office', type: 'ssl', gateway: '127.0.0.1', port, username: 'amir', trustedCert: pin, savePassword: true, password: 'secret' });
+    const connecting = m.connect(p.id);
+    const q = await nextPrompt(m);
+    assert.equal(q.kind, 'otp');
+    m.answer(q.id, '123456');
+    assert.equal((await connecting).status, 'connected');
+    await m.shutdown();
+  });
+
+  test('a changed certificate is flagged, and refusing it cancels', async () => {
+    const { m, started } = await fakeManager('ok', { checkCertificates: true });
+    const old = `pin-sha256:${'B'.repeat(43)}=`;
+    const p = m.addProfile({ name: 'Office', type: 'ssl', gateway: '127.0.0.1', port, username: 'amir', trustedCert: old, savePassword: true, password: 'secret' });
+    const connecting = m.connect(p.id);
+    const q = await nextPrompt(m);
+    assert.equal(q.kind, 'cert');
+    assert.match(q.message, /has changed since you trusted it/);
+    m.answer(q.id, 'no');
+    assert.equal((await connecting.catch((e: Error) => e.message)), 'Cancelled');
+    assert.equal(started.length, 0);
+    assert.equal(m.getProfile(p.id)!.trustedCert, old);
+    assert.equal(m.state().connection.status, 'disconnected');
+    await m.shutdown();
   });
 });
 

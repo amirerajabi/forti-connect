@@ -59,6 +59,8 @@ export interface ManagerOptions {
   reconnectDelays?: number[];
   /** How long a connection has to stay up before the reconnect attempts count from zero again. */
   stableAfterMs?: number;
+  /** false: skip the certificate check before SSL-VPN connects (tests whose gateways are not real). */
+  checkCertificates?: boolean;
 }
 
 const EMPTY_TRAFFIC: Traffic = { up: 0, down: 0, totalUp: 0, totalDown: 0 };
@@ -403,6 +405,35 @@ export class Manager extends EventEmitter {
     this.changedProfiles();
   }
 
+  /**
+   * SSL-VPN: settle the gateway's certificate before OpenConnect starts. OpenConnect asks about a certificate it does not
+   * trust on stdout, which Windows holds back while stdout is a pipe, so that question never arrives and connecting
+   * times out. Asked here instead, the answer reaches OpenConnect as --servercert. A gateway that cannot be reached is
+   * left to OpenConnect to report.
+   */
+  private async settleCertificate(stored: StoredProfile): Promise<void> {
+    if (this.opts.checkCertificates === false) return;
+    const check = await checkGateway('ssl', stored.gateway, stored.port);
+    if (!check.ok || !check.certPin) return;
+    if (check.certTrusted) {
+      // The computer trusts it now (a proper certificate replaced a self-signed one): an old pin would only get in the way.
+      if (stored.trustedCert && stored.trustedCert !== check.certPin) {
+        this.log('app', `${stored.gateway} now has a certificate this computer trusts; the pinned one is no longer needed`);
+        stored.trustedCert = undefined;
+        this.changedProfiles();
+      }
+      return;
+    }
+    if (stored.trustedCert === check.certPin) return;
+    const subject = check.certSubject ? ` (issued to "${check.certSubject}")` : '';
+    const message = stored.trustedCert
+      ? `The gateway's certificate has changed since you trusted it${subject}. Trust the new one only if your administrator replaced it.`
+      : `The gateway's certificate is not trusted by this computer${subject}. FortiGates often use their own; trust it if the pin matches what your administrator gave you.`;
+    const answer = await this.ask({ kind: 'cert', message, detail: check.certPin });
+    if (answer === null || !/^y(es)?$/i.test(answer.trim())) throw new Error('Cancelled');
+    this.trustCert(stored.id, check.certPin);
+  }
+
   // ---------------------------------------------------------------- connection
 
   private queue<T>(fn: () => Promise<T>): Promise<T> {
@@ -441,8 +472,9 @@ export class Manager extends EventEmitter {
     this.log('app', `Connecting to ${profile.name}: ${profile.type === 'ssl' ? 'SSL-VPN' : 'IPsec'} ${target}`);
     let tunnel: Tunnel | null = null;
     try {
+      if (profile.type === 'ssl') await this.settleCertificate(stored);
       tunnel = this.makeTunnel({
-        profile,
+        profile: this.view(stored),
         secrets: this.secrets.get(profile.id),
         settings: this.settings,
         backends: this.backends,

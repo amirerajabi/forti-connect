@@ -61,7 +61,9 @@ export interface OpenconnectOptions {
 
 export function openconnectArgs(o: OpenconnectOptions): string[] {
   const p = o.profile;
-  const args = ['--protocol=fortinet'];
+  // Straight to the gateway like FortiClient: OpenConnect would otherwise follow HTTPS_PROXY, often another app's local
+  // proxy (RayConnect, v2rayN), and the VPN would break as soon as that app disconnects.
+  const args = ['--protocol=fortinet', '--no-proxy'];
   if (p.username) args.push('--user', p.username);
   if (p.trustedCert) args.push('--servercert', p.trustedCert);
   if (p.clientCert) args.push('--certificate', p.clientCert);
