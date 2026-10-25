@@ -130,6 +130,32 @@ function toggleTheme(): void {
 
 const nav = (page: Page) => () => useUi.getState().go(page);
 
+/** Why the VPN helper cannot be changed right now, or null. */
+function helperUnavailable(): string | null {
+  const b = useEngine.getState().backends;
+  if (b.platform !== 'win32' || !b.helper) return 'Only Windows needs the VPN helper';
+  return b.helper.busy ? 'Waiting for the administrator prompt…' : null;
+}
+
+/** Windows asks for administrator rights once; afterwards SSL-VPN works with FortiConnect as a normal user. */
+export async function installHelper(): Promise<void> {
+  useUi.getState().toast({ level: 'info', text: t('Windows will ask for administrator rights to install the VPN helper.') });
+  const b = await attempt(() => api.installHelper(), 'Could not install the VPN helper');
+  if (b) useEngine.getState().setBackends(b);
+}
+
+export async function removeHelper(): Promise<void> {
+  const r = await useUi.getState().askConfirm({
+    title: t('Remove the VPN helper'),
+    message: t('SSL-VPN will then need FortiConnect running as administrator. Windows asks for administrator rights to remove it.'),
+    confirmLabel: t('Remove'),
+    danger: true,
+  });
+  if (!r.ok) return;
+  const b = await attempt(() => api.removeHelper(), 'Could not remove the VPN helper');
+  if (b) useEngine.getState().setBackends(b);
+}
+
 export const COMMANDS: Command[] = [
   {
     id: 'conn.toggle',
@@ -197,6 +223,20 @@ export const COMMANDS: Command[] = [
       return useEngine.getState().backends.elevated ? 'FortiConnect already runs as administrator' : null;
     },
     run: () => getPlatform().relaunchAsAdmin(),
+  },
+  {
+    id: 'helper.install',
+    label: 'Install the VPN helper',
+    icon: ShieldCheck,
+    disabled: helperUnavailable,
+    run: installHelper,
+  },
+  {
+    id: 'helper.remove',
+    label: 'Remove the VPN helper',
+    icon: Trash2,
+    disabled: () => helperUnavailable() ?? (useEngine.getState().backends.helper?.state === 'missing' ? 'The VPN helper is not installed' : null),
+    run: removeHelper,
   },
   {
     id: 'app.checkUpdates',

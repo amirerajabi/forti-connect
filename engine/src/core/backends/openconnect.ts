@@ -40,7 +40,8 @@ export async function detectOpenconnect(configured: string, dataDir: string, pla
   const { version, fortinet } = parseVersion(await commandOutput(p, ['--version']));
   if (!version) return { available: false, kind: 'openconnect', path: p, version: null, note: 'This file does not look like OpenConnect' };
   if (!fortinet) return { available: false, kind: 'openconnect', path: p, version, note: 'This OpenConnect is too old for FortiGate SSL-VPN (it needs 9.0 or newer)' };
-  const note = platform === 'win32' && !elevated ? 'Needs FortiConnect to run as administrator' : platform !== 'win32' && !elevated ? 'Asks for your computer password when connecting (sudo)' : undefined;
+  // On Windows the note depends on the VPN helper too: detectBackends adds it.
+  const note = platform !== 'win32' && !elevated ? 'Asks for your computer password when connecting (sudo)' : undefined;
   return { available: true, kind: 'openconnect', path: p, version, note };
 }
 
@@ -101,8 +102,10 @@ export const openconnectDialect: Dialect = {
     return null;
   },
   isError(line: string): boolean {
-    return /fail|error|unable|refused|denied|invalid|cannot|could not/i.test(line) && !/DTLS/i.test(line);
+    // OpenConnect prints the verify failure even when the certificate is pinned with --servercert and then accepted.
+    return /fail|error|unable|refused|denied|invalid|cannot|could not/i.test(line) && !/DTLS|Server certificate verify failed/i.test(line);
   },
+  level: (line) => (/Server certificate verify failed/i.test(line) ? 'info' : undefined),
   adminRefused: (line) => /Sorry, try again/i.test(line),
   failure(last: string | undefined, code: number | null): string {
     const l = last ?? '';

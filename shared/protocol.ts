@@ -128,12 +128,32 @@ export interface BackendInfo {
   modes?: IkeMode[];
 }
 
+/**
+ * The FortiConnect VPN helper (Windows): a small program running as SYSTEM that starts OpenConnect for FortiConnect,
+ * so FortiConnect itself runs as a normal user. Installed once, with one administrator prompt.
+ * - running: it answers (and is this version or newer)
+ * - outdated: it answers but is older than this FortiConnect expects: install again to update it
+ * - stopped: installed but not answering (it starts with Windows; it may still be starting)
+ * - other-user: installed for another Windows account; installing again adds this one
+ * - missing: not installed
+ */
+export interface HelperInfo {
+  state: 'running' | 'outdated' | 'stopped' | 'other-user' | 'missing';
+  version: number | null;
+  /** The version this FortiConnect brings. */
+  current: number;
+  /** An install or removal is under way (waiting for the administrator prompt). */
+  busy?: boolean;
+}
+
 export interface Backends {
   ssl: BackendInfo;
   ipsec: BackendInfo;
-  /** The engine runs with administrator / root rights (SSL-VPN on Windows needs them). */
+  /** The engine runs with administrator / root rights (SSL-VPN on Windows needs them, or the helper). */
   elevated: boolean;
   platform: 'win32' | 'darwin' | 'linux';
+  /** Windows only. */
+  helper?: HelperInfo;
 }
 
 export type ThemePref = 'system' | 'light' | 'dark';

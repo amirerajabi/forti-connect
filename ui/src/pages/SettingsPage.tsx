@@ -1,6 +1,6 @@
 import { Cable, FolderOpen, Info, KeyRound, LoaderCircle, RefreshCw, RotateCw, Settings, ShieldCheck, SlidersHorizontal, Smartphone, Wrench } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
-import type { BackendInfo, LogLevel, Settings as SettingsT } from '../../../shared/protocol';
+import type { BackendInfo, HelperInfo, LogLevel, Settings as SettingsT } from '../../../shared/protocol';
 import { api } from '../api/client';
 import { attempt, runCommand } from '../app/commands';
 import { Field } from '../components/common/Dialog';
@@ -227,16 +227,7 @@ function ProgramsSection({ s }: { s: SettingsT }) {
       <BackendCard title={t('SSL-VPN')} info={backends.ssl} />
       <PathField label={t('OpenConnect program')} hint={t('Leave empty to find it automatically.')} value={s.openconnectPath} purpose="openconnect" placeholder={win ? 'C:\\…\\openconnect.exe' : '/usr/sbin/openconnect'} onSave={(v) => save({ openconnectPath: v })} />
       <PathField label={t('vpnc-script')} hint={t('Sets up addresses and routes for OpenConnect. Leave empty for the one next to it or its default.')} value={s.vpncScript} purpose="script" placeholder={win ? 'C:\\…\\vpnc-script-win.js' : '/etc/vpnc/vpnc-script'} onSave={(v) => save({ vpncScript: v })} />
-      {win && !backends.elevated && (
-        <div className="notice warning">
-          <span className="flex-1">{t('SSL-VPN on Windows needs administrator rights to create its network adapter.')}</span>
-          {getPlatform().kind === 'electron' && (
-            <button className="btn btn-xs btn-primary" onClick={() => runCommand('app.relaunchAdmin')}>
-              {t('Restart as administrator')}
-            </button>
-          )}
-        </div>
-      )}
+      {win && backends.helper && <HelperCard info={backends.helper} elevated={backends.elevated} />}
       <BackendCard title={t('IPsec')} info={backends.ipsec} />
       {win ? (
         <p className="muted settings-note">{t('On Windows, IPsec uses Windows’ own VPN client: IKEv2 and L2TP/IPsec. IKEv1 with XAuth is not part of Windows.')}</p>
@@ -250,6 +241,56 @@ function ProgramsSection({ s }: { s: SettingsT }) {
       </div>
       <p className="muted settings-note selectable">{t(INSTALL_HINT[backends.platform])}</p>
     </div>
+  );
+}
+
+const HELPER_TEXT: Record<HelperInfo['state'], string> = {
+  running: 'Running. SSL-VPN works with FortiConnect as a normal user.',
+  outdated: 'Running, but older than this FortiConnect. Update it.',
+  stopped: 'Installed but not running. It starts with Windows; install it again if it stays stopped.',
+  'other-user': 'Installed for another Windows account. Install it again to add yours.',
+  missing: 'Not installed. Without it, SSL-VPN needs FortiConnect running as administrator.',
+};
+
+/**
+ * The Windows VPN helper: a small program that runs as SYSTEM and starts OpenConnect for FortiConnect, like FortiClient's
+ * own service, so FortiConnect itself needs no administrator rights.
+ */
+function HelperCard({ info, elevated }: { info: HelperInfo; elevated: boolean }) {
+  const t = useT();
+  const ok = info.state === 'running';
+  const installed = info.state !== 'missing';
+  return (
+    <>
+      <div className="info-card">
+        <ShieldCheck size={18} className={ok ? 'text-success' : 'text-warning'} />
+        <div className="flex-1">
+          <strong>
+            {t('VPN helper')}
+            {info.version ? <span className="muted tabular"> · v{info.version}</span> : null}
+          </strong>
+          <p className="muted">{t(HELPER_TEXT[info.state])}</p>
+          <p className="muted field-hint">{t('It runs as SYSTEM from C:\\Program Files\\FortiConnect Helper, only for your Windows account, and only starts the OpenConnect installed under Program Files.')}</p>
+        </div>
+      </div>
+      <div className="input-with-btn">
+        {!ok && (
+          <button className="btn btn-primary" disabled={!!info.busy} onClick={() => runCommand('helper.install')}>
+            {info.busy ? <LoaderCircle size={16} className="spin" /> : <ShieldCheck size={16} />} {info.state === 'outdated' ? t('Update the VPN helper') : installed ? t('Install again') : t('Install the VPN helper')}
+          </button>
+        )}
+        {installed && (
+          <button className="btn" disabled={!!info.busy} onClick={() => runCommand('helper.remove')}>
+            {t('Remove the VPN helper')}
+          </button>
+        )}
+        {!ok && !elevated && getPlatform().kind === 'electron' && (
+          <button className="btn" onClick={() => runCommand('app.relaunchAdmin')}>
+            {t('Restart as administrator')}
+          </button>
+        )}
+      </div>
+    </>
   );
 }
 

@@ -5,7 +5,7 @@ import type { EngineEvent, EngineState, ProfileInput, Settings } from '../../../
 import type { Manager } from '../core/Manager';
 import { errorMessage } from '../core/util';
 
-export const ENGINE_VERSION = '0.1.1';
+export const ENGINE_VERSION = '0.2.0';
 
 type Handler = (ctx: { body: any; params: Record<string, string> }) => Promise<unknown> | unknown;
 
@@ -68,6 +68,8 @@ export function createServer(manager: Manager, token: string): http.Server {
   route('POST', '/api/disconnect', () => manager.disconnect());
 
   route('POST', '/api/backends/refresh', () => manager.refreshBackends());
+  route('POST', '/api/helper/install', () => manager.installHelper());
+  route('POST', '/api/helper/remove', () => manager.removeHelper());
   route('POST', '/api/logs/clear', () => (manager.clearLogs(), { ok: true }));
 
   const tokenBuf = Buffer.from(token);

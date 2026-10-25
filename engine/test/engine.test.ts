@@ -2,8 +2,9 @@
 // read, the gateway check against a local TLS server, and the Manager connecting through a fake VPN program that asks
 // what OpenConnect asks. Nothing here starts a real VPN, touches the network outside 127.0.0.1, or needs admin rights.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { X509Certificate } from 'node:crypto';
+import { gunzipSync } from 'node:zlib';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -13,6 +14,8 @@ import type { Backends, EngineEvent, Profile, ProfileConfig } from '../../shared
 import { charonArgs, charonCommand, charonDialect, shellQuote } from '../src/core/backends/charon';
 import { ADMIN_PROMPT, openconnectArgs, openconnectDialect, parseVersion, withSudo } from '../src/core/backends/openconnect';
 import { ProcessTunnel } from '../src/core/backends/process';
+import { detectHelper, helloHelper, helperProcess } from '../src/core/backends/helper';
+import { HELPER_PS1, HELPER_VERSION, installScript } from '../src/core/backends/helper-script';
 import { createEnv, entryName, rasError } from '../src/core/backends/ras';
 import { Manager } from '../src/core/Manager';
 import { certPin, checkGateway } from '../src/core/net';
@@ -153,6 +156,9 @@ describe('OpenConnect', () => {
     assert.deepEqual(openconnectDialect.progress('Configured as 10.212.134.200, with SSL connected and DTLS in progress'), { up: true, address: '10.212.134.200', device: undefined });
     assert.equal(openconnectDialect.progress('Connected to HTTPS on vpn.example.com with ciphersuite (TLS1.3)'), null);
     assert.match(openconnectDialect.failure('Login failed.', 1), /refused the user name/);
+    // Printed even when the pinned certificate is then accepted: not a failure, not the reason for one.
+    assert.equal(openconnectDialect.isError('Server certificate verify failed: signer not found'), false);
+    assert.equal(openconnectDialect.level?.('Server certificate verify failed: signer not found'), 'info');
   });
 });
 
@@ -466,6 +472,93 @@ describe('Manager: the gateway certificate before connecting', () => {
     assert.equal(m.state().connection.status, 'disconnected');
     await m.shutdown();
   });
+});
+
+// The Windows VPN helper: the real script (PowerShell compiling the C#), run in test mode as this user on its own pipe,
+// with the fake VPN program in place of OpenConnect. The Manager runs as a normal user and connects through it.
+describe('Windows VPN helper', { skip: process.platform !== 'win32' }, () => {
+  const pipeName = `forticonnect-test-${process.pid}`;
+  const pipe = `\\\\.\\pipe\\${pipeName}`;
+  let helper: ChildProcess;
+  let helperLog = '';
+  const dir = tmpDir();
+  const HELPER_BACKENDS: Backends = {
+    ssl: { available: true, kind: 'openconnect', path: 'C:\\Program Files\\OpenConnect\\openconnect.exe', version: 'test' },
+    ipsec: { available: true, kind: 'ras', path: null, version: null },
+    elevated: false,
+    platform: 'win32',
+    helper: { state: 'running', version: HELPER_VERSION, current: HELPER_VERSION },
+  };
+
+  before(async () => {
+    fs.writeFileSync(path.join(dir, 'fc-helper.ps1'), HELPER_PS1);
+    helper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(dir, 'fc-helper.ps1'), '-PipeName', pipeName, '-TestCommand', `${process.execPath}|${FAKE_VPN}|ok`, '-WorkDir', path.join(dir, 'work')], { windowsHide: true });
+    helper.stdout?.on('data', (d: Buffer) => (helperLog += d));
+    helper.stderr?.on('data', (d: Buffer) => (helperLog += d));
+    // PowerShell compiles the helper when it starts.
+    const until = Date.now() + 90_000;
+    while (Date.now() < until) {
+      if ((await helloHelper(pipe, 1000)) === HELPER_VERSION) return;
+      if (helper.exitCode !== null) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`The helper did not start: ${helperLog}`);
+  });
+  after(() => helper?.kill());
+
+  test('answers hello with its version, and detection says running', async () => {
+    assert.equal(await helloHelper(pipe), HELPER_VERSION);
+    const info = await detectHelper(pipe);
+    assert.equal(info.state, 'running');
+    assert.equal(await helloHelper('\\\\.\\pipe\\forticonnect-nobody-here', 500), null);
+  });
+
+  test('the Manager connects SSL-VPN through it without administrator rights, and disconnecting ends it', async () => {
+    const m = new Manager(tmpDir(), { platform: 'win32', elevated: false, backends: HELPER_BACKENDS, secretKey: KEY, checkCertificates: false, helperPipe: pipe });
+    await m.load();
+    const p = m.addProfile({ name: 'Office', ...SSL, savePassword: true, password: 'secret' });
+    const connecting = m.connect(p.id);
+    const q = await nextPrompt(m, 20_000);
+    assert.equal(q.kind, 'otp');
+    m.answer(q.id, '123456');
+    const c = await connecting;
+    assert.equal(c.status, 'connected');
+    assert.equal(c.address, '10.10.0.5');
+    assert.ok(!m.state().logs.some((l) => l.text.includes('secret')));
+    // The helper built OpenConnect's command line itself.
+    assert.ok(m.state().logs.some((l) => l.text.includes('password=•••')));
+    await m.disconnect();
+    assert.equal(m.state().connection.status, 'disconnected');
+    // One connection at a time, and the last one is gone: a new one may start.
+    const again = m.connect(p.id);
+    m.answer((await nextPrompt(m, 20_000)).id, '123456');
+    assert.equal((await again).status, 'connected');
+    await m.shutdown();
+  });
+
+  test('it refuses fields it cannot check, and an absent helper is a clear error', async () => {
+    const bad = helperProcess({ gateway: 'evil.example.com & calc', port: 443, realm: '', user: 'u', servercert: '', verbose: false }, pipe);
+    const err = await new Promise<string>((resolve) => bad.onError((e) => resolve(e.message)));
+    assert.match(err, /Invalid gateway/);
+    const none = helperProcess({ gateway: 'vpn.example.com', port: 443, realm: '', user: 'u', servercert: '', verbose: false }, '\\\\.\\pipe\\forticonnect-nobody-here');
+    assert.match(await new Promise<string>((resolve) => none.onError((e) => resolve(e.message))), /not running/);
+    const m = new Manager(tmpDir(), { platform: 'win32', elevated: false, backends: { ...HELPER_BACKENDS, helper: { state: 'missing', version: null, current: HELPER_VERSION } }, secretKey: KEY, checkCertificates: false });
+    await m.load();
+    const p = m.addProfile({ name: 'Office', ...SSL, savePassword: true, password: 'secret' });
+    await assert.rejects(m.connect(p.id), /needs the FortiConnect VPN helper/);
+    await m.shutdown();
+  });
+});
+
+test('the elevated install script embeds the helper and only takes a real account id', () => {
+  const s = installScript('S-1-5-21-1-2-3-1001');
+  assert.match(s, /Register-ScheduledTask/);
+  assert.match(s, /'S-1-5-21-1-2-3-1001'/);
+  const embedded = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(s)![1];
+  assert.equal(gunzipSync(Buffer.from(embedded, 'base64')).toString('utf8'), HELPER_PS1);
+  assert.throws(() => installScript("S-1-5'; Remove-Item C:\\ -Recurse; '"), /account id/);
+  // It travels as -EncodedCommand, which Windows caps at 32767 characters for the whole command line.
+  assert.ok(Buffer.from(s, 'utf16le').toString('base64').length < 30_000, `the encoded install script is too long: ${Buffer.from(s, 'utf16le').toString('base64').length}`);
 });
 
 describe('HTTP API', () => {

@@ -20,6 +20,7 @@ import type {
   VpnType,
 } from '../../../shared/protocol';
 import { createTunnel, detectBackends, type TunnelFactory } from './backends';
+import { installHelper, removeHelper } from './backends/helper';
 import { disconnectRas } from './backends/ras';
 import type { Leftover, PromptRequest, Tunnel } from './backends/types';
 import { checkGateway } from './net';
@@ -61,6 +62,8 @@ export interface ManagerOptions {
   stableAfterMs?: number;
   /** false: skip the certificate check before SSL-VPN connects (tests whose gateways are not real). */
   checkCertificates?: boolean;
+  /** The Windows VPN helper's pipe (tests run their own helper). */
+  helperPipe?: string;
 }
 
 const EMPTY_TRAFFIC: Traffic = { up: 0, down: 0, totalUp: 0, totalDown: 0 };
@@ -246,8 +249,44 @@ export class Manager extends EventEmitter {
 
   async refreshBackends(): Promise<Backends> {
     if (this.opts.backends) return this.backends;
-    this.backends = await detectBackends(this.settings, this.dataDir, this.platform, this.elevated);
+    this.backends = await detectBackends(this.settings, this.dataDir, this.platform, this.elevated, this.opts.helperPipe);
     this.emitEvent({ type: 'backends', backends: this.backends });
+    return this.backends;
+  }
+
+  private setHelperBusy(busy: boolean): void {
+    if (!this.backends.helper) return;
+    this.backends = { ...this.backends, helper: { ...this.backends.helper, busy } };
+    this.emitEvent({ type: 'backends', backends: this.backends });
+  }
+
+  /** Windows: install or update the VPN helper (one administrator prompt), so SSL-VPN works without elevation. */
+  async installHelper(): Promise<Backends> {
+    return this.helperStep('install');
+  }
+
+  async removeHelper(): Promise<Backends> {
+    if (this.connection.status !== 'disconnected' && !this.elevated) throw new Error('Disconnect first: the connection runs through the helper');
+    return this.helperStep('remove');
+  }
+
+  private async helperStep(step: 'install' | 'remove'): Promise<Backends> {
+    if (this.platform !== 'win32') throw new Error('The VPN helper is for Windows');
+    if (this.backends.helper?.busy) throw new Error('The VPN helper is already being changed');
+    this.setHelperBusy(true);
+    try {
+      this.log('app', step === 'install' ? 'Installing the FortiConnect VPN helper (Windows asks for administrator rights)' : 'Removing the FortiConnect VPN helper');
+      const info = await (step === 'install' ? installHelper(this.opts.helperPipe) : removeHelper(this.opts.helperPipe));
+      this.log('app', `VPN helper: ${info.state}${info.version ? ` (version ${info.version})` : ''}`);
+      if (step === 'install' && info.state !== 'running') throw new Error('The VPN helper was installed but does not answer yet. Try "Look again" in a moment, or restart Windows.');
+      if (step === 'install') this.notify('success', 'The VPN helper is installed', 'FortiConnect can now connect SSL-VPN without administrator rights.');
+    } catch (e) {
+      const message = errorMessage(e);
+      if (message !== 'Cancelled') this.log('error', `VPN helper: ${message}`);
+      throw new Error(message === 'Cancelled' ? 'Windows did not get administrator rights (the prompt was declined)' : message);
+    } finally {
+      await this.refreshBackends();
+    }
     return this.backends;
   }
 
@@ -472,7 +511,11 @@ export class Manager extends EventEmitter {
     this.log('app', `Connecting to ${profile.name}: ${profile.type === 'ssl' ? 'SSL-VPN' : 'IPsec'} ${target}`);
     let tunnel: Tunnel | null = null;
     try {
-      if (profile.type === 'ssl') await this.settleCertificate(stored);
+      if (profile.type === 'ssl') {
+        // The helper may have started (or stopped) since the last look: it decides how SSL-VPN runs here.
+        if (this.platform === 'win32' && !this.elevated) await this.refreshBackends();
+        await this.settleCertificate(stored);
+      }
       tunnel = this.makeTunnel({
         profile: this.view(stored),
         secrets: this.secrets.get(profile.id),
@@ -480,6 +523,7 @@ export class Manager extends EventEmitter {
         backends: this.backends,
         platform: this.platform,
         elevated: this.elevated,
+        helperPipe: this.opts.helperPipe,
         hooks: {
           log: (l) => this.pushLog(l),
           ask: (p) => this.ask(p),

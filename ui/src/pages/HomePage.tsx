@@ -151,14 +151,25 @@ function BackendNotice({ profile }: { profile: Profile }) {
       </div>
     );
   }
-  if (profile.type === 'ssl' && backends.platform === 'win32' && !backends.elevated) {
+  const helper = backends.helper;
+  if (profile.type === 'ssl' && backends.platform === 'win32' && !backends.elevated && helper?.state !== 'running') {
+    const outdated = helper?.state === 'outdated';
     return (
-      <div className="notice warning backend-notice">
+      <div className={`notice${outdated ? '' : ' warning'} backend-notice`}>
         <ShieldAlert size={16} />
-        <span className="flex-1">{t('SSL-VPN on Windows needs administrator rights to create its network adapter.')}</span>
-        {getPlatform().kind === 'electron' && (
-          <button className="btn btn-xs btn-primary" onClick={() => runCommand('app.relaunchAdmin')}>
-            <ShieldCheck size={14} /> {t('Restart as administrator')}
+        <span className="flex-1">
+          {outdated
+            ? t('A newer VPN helper comes with this FortiConnect. Update it (Windows asks for administrator rights once).')
+            : helper?.state === 'stopped'
+              ? t('The VPN helper is installed but not running. It starts with Windows; install it again if it stays stopped.')
+              : t('SSL-VPN on Windows needs the FortiConnect VPN helper. Install it once (Windows asks for administrator rights), then FortiConnect works without them.')}
+        </span>
+        <button className="btn btn-xs btn-primary" disabled={!!helper?.busy} onClick={() => runCommand('helper.install')}>
+          {helper?.busy ? <LoaderCircle size={14} className="spin" /> : <ShieldCheck size={14} />} {outdated ? t('Update the VPN helper') : t('Install the VPN helper')}
+        </button>
+        {!outdated && getPlatform().kind === 'electron' && (
+          <button className="btn btn-xs" onClick={() => runCommand('app.relaunchAdmin')}>
+            {t('Restart as administrator')}
           </button>
         )}
       </div>

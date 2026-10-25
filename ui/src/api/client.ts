@@ -40,5 +40,7 @@ export const api = {
   answer: (id: string, value: string, remember?: boolean) => call<{ ok: true }>('POST', '/api/connect/answer', { id, value, remember }),
   disconnect: () => call<ConnectionState>('POST', '/api/disconnect'),
   refreshBackends: () => call<Backends>('POST', '/api/backends/refresh'),
+  installHelper: () => call<Backends>('POST', '/api/helper/install'),
+  removeHelper: () => call<Backends>('POST', '/api/helper/remove'),
   clearLogs: () => call<{ ok: true }>('POST', '/api/logs/clear'),
 };

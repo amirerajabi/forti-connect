@@ -1,9 +1,28 @@
 # Status
 
-Released: 0.1.1 (tag v0.1.1, 2026-10-25), at https://github.com/amirerajabi/forti-connect. Before it: 0.1.0, the first
-release, the same day. The release workflow builds the Windows installer, the macOS DMG / ZIP and the Linux AppImage
-with their update metadata (for 0.1.0 the installer's SHA-512 matched `latest.yml`). An installed 0.1.0 updating to
-0.1.1 has not been watched.
+Released: 0.2.0 (tag v0.2.0, 2026-10-25), at https://github.com/amirerajabi/forti-connect. Before it: 0.1.1 and 0.1.0
+(the first release), the same day. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
+Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
+update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.2.0
+
+- **The Windows VPN helper:** SSL-VPN on Windows no longer needs FortiConnect running as administrator. A small helper
+  (`engine/src/core/backends/helper-script.ts`: PowerShell compiling C#, so nothing to install) runs as SYSTEM from
+  `C:\Program Files\FortiConnect Helper` through a scheduled task started at boot, and starts OpenConnect when
+  FortiConnect asks over a named pipe only the user's account can open. Installed and removed from Home or Settings →
+  VPN programs with one UAC prompt. "Restart as administrator" stays as the alternative.
+- Verified on the developer's machine: the helper installed through the app (UAC accepted), runs in session 0 as an
+  account a normal user cannot see (SYSTEM), the folder is writable only by TrustedInstaller / SYSTEM / Administrators,
+  `users.txt` holds the one account. FortiConnect, as a normal user, connected through it to the real gateway
+  185.103.131.114:20443: the certificate question, then OpenConnect (run by the helper) connected directly and asked
+  `Password:`; disconnecting there ended it cleanly. A full login through the helper has not been done.
+- Tests run the real helper script in a test mode (this user, its own pipe, the fake OpenConnect) and connect through it.
+- OpenConnect's "Server certificate verify failed" line, printed even when the pinned certificate is then accepted, is
+  no longer shown as an error or kept as the reason for a later failure.
+- Not done: uninstalling FortiConnect leaves the helper (remove it first from Settings → VPN programs); the client does
+  not check that the pipe's server really is the helper (a process that took the pipe name first while the helper was
+  not running could pose as it).
 
 ## In 0.1.1
 
@@ -27,6 +46,15 @@ with their update metadata (for 0.1.0 the installer's SHA-512 matched `latest.ym
   certificate pin against a local self-signed server.
 - The UI in the browser build: adding an SSL-VPN profile by pasting a portal address (fills port and realm), the Home
   page with the "OpenConnect not found" notice, Settings → VPN programs, the tray panel at `#tray`, Persian right to left.
+
+## Known issues
+
+- **An update installed while FortiConnect runs as administrator moves it to all users.** The NSIS installer, started
+  elevated by the updater, installs per-machine (`C:\Program Files\FortiConnect`, shortcuts on the Public desktop) and
+  removes the per-user copy; pins to the old path break. Seen on the developer's machine going from 0.1.0 to 0.1.1. A
+  fix would be `perMachine: true` in `desktop/electron-builder.yml` (always all users; non-elevated updates then ask
+  UAC). Left as is for now, at the user's choice. With the VPN helper (0.2.0) FortiConnect normally runs unelevated,
+  so this only happens when someone still uses "Restart as administrator".
 
 ## Not verified yet
 

@@ -1,7 +1,7 @@
-// A VPN program run as a child process (OpenConnect, charon-cmd): its output becomes log lines, its questions
-// ("Password:", "Enter 'yes' to accept…") are answered from the saved secrets or put to the user, and a line saying the
-// tunnel is up resolves start(). The program-specific parts live in a Dialect.
-import { spawn, type ChildProcess } from 'node:child_process';
+// A VPN program run as a child process (OpenConnect, charon-cmd), or by the Windows VPN helper on our behalf: its
+// output becomes log lines, its questions ("Password:", "Enter 'yes' to accept…") are answered from the saved secrets or
+// put to the user, and a line saying the tunnel is up resolves start(). The program-specific parts live in a Dialect.
+import { spawn } from 'node:child_process';
 import * as os from 'node:os';
 import type { LogLine } from '../../../../shared/protocol';
 import type { ProfileSecrets } from '../secrets';
@@ -24,12 +24,49 @@ export interface Dialect {
   failure(lastError: string | undefined, code: number | null): string;
   /** A line saying sudo refused the computer password. */
   adminRefused?(line: string): boolean;
+  /** The log level for a line whose words mislead (a "failed" that is not a failure); undefined: judge by its words. */
+  level?(line: string): LogLine['level'] | undefined;
+}
+
+/** A running VPN program as ProcessTunnel sees it: a child process of ours, or one the VPN helper runs for us. */
+export interface VpnProcess {
+  /** Set for our own child (recorded for crash repair); the helper's ends with the pipe, so it needs none. */
+  readonly pid: number | undefined;
+  readonly exited: boolean;
+  onData(cb: (d: Buffer) => void): void;
+  onExit(cb: (code: number | null) => void): void;
+  onError(cb: (e: Error) => void): void;
+  write(text: string): void;
+  /** Ask it to end (signal `signal` on POSIX); `hard` when it did not. */
+  kill(hard: boolean, signal?: NodeJS.Signals): void;
+}
+
+/** `file` with `args` as our own child process. */
+export function localProcess(file: string, args: string[], env?: NodeJS.ProcessEnv): VpnProcess {
+  const child = spawn(file, args, { windowsHide: true, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+  child.stdin?.on('error', () => undefined);
+  return {
+    pid: child.pid,
+    get exited() {
+      return child.exitCode !== null || child.signalCode !== null;
+    },
+    onData: (cb) => {
+      child.stdout?.on('data', cb);
+      child.stderr?.on('data', cb);
+    },
+    onExit: (cb) => void child.once('exit', (code) => cb(code)),
+    onError: (cb) => void child.once('error', cb),
+    write: (text) => void child.stdin?.write(text),
+    kill: (hard, signal) => void child.kill(hard ? 'SIGKILL' : process.platform === 'win32' ? undefined : (signal ?? 'SIGTERM')),
+  };
 }
 
 export interface ProcessSpec {
   file: string;
   args: string[];
   env?: NodeJS.ProcessEnv;
+  /** Run it some other way than spawning file + args (through the VPN helper). */
+  launch?: () => VpnProcess;
   username: string;
   secrets: ProfileSecrets;
   dialect: Dialect;
@@ -58,7 +95,7 @@ export function deviceFor(ip: string | null): string | null {
 }
 
 export class ProcessTunnel implements Tunnel {
-  private child: ChildProcess | null = null;
+  private child: VpnProcess | null = null;
   private stopping = false;
   private up = false;
   private lastError: string | undefined;
@@ -72,7 +109,7 @@ export class ProcessTunnel implements Tunnel {
   constructor(private readonly s: ProcessSpec) {}
 
   get running(): boolean {
-    return !!this.child && this.child.exitCode === null && this.child.signalCode === null;
+    return !!this.child && !this.child.exited;
   }
 
   get leftover(): Leftover | null {
@@ -103,19 +140,18 @@ export class ProcessTunnel implements Tunnel {
       };
       this.onCancel = () => fail('Cancelled');
 
-      let child: ChildProcess;
+      let child: VpnProcess;
       try {
-        child = spawn(this.s.file, this.s.args, { windowsHide: true, env: this.s.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'] });
+        child = this.s.launch ? this.s.launch() : localProcess(this.s.file, this.s.args, this.s.env);
       } catch (e) {
         return fail(`Could not run ${this.s.dialect.name}: ${errorMessage(e)}`);
       }
       this.child = child;
       arm();
-      child.stdout?.on('data', (d: Buffer) => this.onData(d));
-      child.stderr?.on('data', (d: Buffer) => this.onData(d));
-      child.stdin?.on('error', () => undefined);
-      child.once('error', (e) => fail(`Could not run ${this.s.dialect.name}: ${errorMessage(e)}`));
-      child.once('exit', (code) => {
+      child.onData((d) => this.onData(d));
+      // The helper's errors are already worded for the user; a spawn error is not.
+      child.onError((e) => fail(this.s.launch ? e.message : `Could not run ${this.s.dialect.name}: ${errorMessage(e)}`));
+      child.onExit((code) => {
         if (this.partial.trim()) this.line(this.partial);
         this.partial = '';
         if (this.child === child) this.child = null;
@@ -132,17 +168,17 @@ export class ProcessTunnel implements Tunnel {
   stop(): Promise<void> {
     const child = this.child;
     this.stopping = true;
-    if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    if (!child || child.exited) return Promise.resolve();
     return new Promise((resolve) => {
       const hard = setTimeout(() => {
-        child.kill('SIGKILL');
+        child.kill(true);
         resolve();
       }, 6000);
-      child.once('exit', () => {
+      child.onExit(() => {
         clearTimeout(hard);
         resolve();
       });
-      child.kill(process.platform === 'win32' ? undefined : (this.s.stopSignal ?? 'SIGTERM'));
+      child.kill(false, this.s.stopSignal);
     });
   }
 
@@ -170,7 +206,7 @@ export class ProcessTunnel implements Tunnel {
     const d = this.s.dialect;
     if (d.isError(text)) this.lastError = text.trim();
     if (d.adminRefused?.(text)) this.used.admin = true;
-    this.s.hooks.log({ t: Date.now(), level: LEVEL.find(([re]) => re.test(text))?.[1] ?? 'info', text });
+    this.s.hooks.log({ t: Date.now(), level: d.level?.(text) ?? LEVEL.find(([re]) => re.test(text))?.[1] ?? 'info', text });
     const p = d.progress(text);
     if (p?.address) this.info.address = p.address;
     if (p?.device) this.info.device = p.device;
@@ -191,7 +227,7 @@ export class ProcessTunnel implements Tunnel {
     try {
       const answer = await this.answer(kind, text);
       if (answer === null) return this.onCancel();
-      this.child?.stdin?.write(`${answer}\n`);
+      this.child?.write(`${answer}\n`);
     } finally {
       this.asking = false;
     }

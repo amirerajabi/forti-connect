@@ -13,6 +13,8 @@ FortiConnect is not made by or affiliated with Fortinet. FortiGate and FortiClie
   - Windows: Windows' own VPN client, with IKEv2 + EAP or L2TP/IPsec + pre-shared key. Nothing to install.
   - macOS and Linux: strongSwan's `charon-cmd`, with IKEv1 + XAuth + pre-shared key (main or aggressive mode, with a
     peer ID: what a FortiGate dial-up tunnel for FortiClient uses) or IKEv2 + EAP.
+- **No administrator rights on Windows:** like FortiClient's own service, a small VPN helper (installed once, with one
+  administrator prompt) starts OpenConnect for FortiConnect, which then runs as a normal user.
 - **Saved passwords stay on this computer**, encrypted with a key the OS keychain protects. Leave them unsaved and
   FortiConnect asks when connecting.
 - **Reconnects** when the tunnel drops, and asks again if the gateway wants a new code.
@@ -26,7 +28,7 @@ FortiConnect is not made by or affiliated with Fortinet. FortiGate and FortiClie
 
 | | SSL-VPN | IPsec |
 | --- | --- | --- |
-| Windows | `openconnect.exe` with `wintun.dll` (for example MSYS2: `pacman -S mingw-w64-ucrt-x86_64-openconnect`), and FortiConnect running **as administrator** (it offers to restart that way) | Nothing. The FortiGate tunnel must allow IKEv2 or L2TP (Windows has no IKEv1 + XAuth). |
+| Windows | `openconnect.exe` with `wintun.dll` (for example MSYS2: `pacman -S mingw-w64-ucrt-x86_64-openconnect`), and, once, the **FortiConnect VPN helper** (one administrator prompt; afterwards FortiConnect runs as a normal user) | Nothing. The FortiGate tunnel must allow IKEv2 or L2TP (Windows has no IKEv1 + XAuth). |
 | macOS | `brew install openconnect` | `brew install strongswan` |
 | Linux | `sudo apt install openconnect` | `sudo apt install strongswan-charon` (or your distribution's `charon-cmd`) |
 
