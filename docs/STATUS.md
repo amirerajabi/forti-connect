@@ -1,7 +1,8 @@
 # Status
 
-Version 0.1.0, not released yet. Not a git repository with commits yet, and no GitHub repository exists: the updater and
-the release workflow point at `amirerajabi/forti-connect`, which has to be created before the first release.
+Released: 0.1.0 (tag v0.1.0, 2026-10-25), the first release, at https://github.com/amirerajabi/forti-connect. The release
+workflow built the Windows installer, the macOS DMG / ZIP and the Linux AppImage with their update metadata; the
+installer's SHA-512 matches `latest.yml`. No installed copy has updated from it yet (there is nothing older).
 
 ## Works (verified on Windows, 2026-10-25)
 
