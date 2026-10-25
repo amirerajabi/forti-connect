@@ -6,6 +6,18 @@ import * as path from 'node:path';
 
 export type Platform = 'win32' | 'darwin' | 'linux';
 
+/**
+ * A program from Windows' own System32, by full path: a bare name follows the PATH, where another 'whoami' or 'net'
+ * (Git's, MSYS2's) may come first and not understand Windows' options.
+ */
+export function sys32(name: string): string {
+  return path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', name);
+}
+
+export function powershellExe(): string {
+  return sys32(path.join('WindowsPowerShell', 'v1.0', 'powershell.exe'));
+}
+
 export function currentPlatform(): Platform {
   return process.platform === 'win32' ? 'win32' : process.platform === 'darwin' ? 'darwin' : 'linux';
 }
@@ -19,7 +31,7 @@ let elevatedCache: boolean | null = null;
 export function isElevated(): boolean {
   if (elevatedCache !== null) return elevatedCache;
   if (process.platform === 'win32') {
-    const r = spawnSync('net', ['session'], { windowsHide: true, stdio: 'ignore', timeout: 5000 });
+    const r = spawnSync(sys32('net.exe'), ['session'], { windowsHide: true, stdio: 'ignore', timeout: 5000 });
     elevatedCache = r.status === 0;
   } else {
     elevatedCache = process.getuid?.() === 0;
@@ -66,7 +78,7 @@ export function processName(pid: number): Promise<string | null> {
   if (!Number.isInteger(pid) || pid <= 0) return Promise.resolve(null);
   return new Promise((resolve) => {
     if (process.platform === 'win32') {
-      execFile('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 5000 }, (err, out) => {
+      execFile(sys32('tasklist.exe'), ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { windowsHide: true, timeout: 5000 }, (err, out) => {
         const name = /^"([^"]+)"/.exec(String(out ?? '').trim())?.[1];
         resolve(err || !name ? null : name);
       });
@@ -77,9 +89,16 @@ export function processName(pid: number): Promise<string | null> {
 }
 
 /** Run a PowerShell script; values go in through the environment so nothing from a profile is ever parsed as code. */
-export function powershell(script: string, env: Record<string, string> = {}, timeoutMs = 30_000): Promise<{ code: number | null; out: string; err: string }> {
+/**
+ * The script goes as -EncodedCommand: PowerShell quits without running a multi-line script piped to its stdin. `oneLine`
+ * sends it on stdin instead, for a single-line script too long for a command line (Windows caps those at 32767
+ * characters), such as the one carrying the elevated install script.
+ */
+export function powershell(script: string, env: Record<string, string> = {}, timeoutMs = 30_000, oneLine = false): Promise<{ code: number | null; out: string; err: string }> {
   return new Promise((resolve) => {
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'], {
+    if (oneLine && /[\r\n]/.test(script.trim())) throw new Error('powershell(oneLine): the script has more than one line');
+    const how = oneLine ? ['-Command', '-'] : ['-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')];
+    const child = spawn(powershellExe(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', ...how], {
       windowsHide: true,
       env: { ...process.env, ...env },
     });
@@ -96,7 +115,8 @@ export function powershell(script: string, env: Record<string, string> = {}, tim
       clearTimeout(timer);
       resolve({ code, out, err });
     });
-    child.stdin.end(script);
+    child.stdin.on('error', () => undefined);
+    child.stdin.end(oneLine ? `${script.trim()}\n` : undefined);
   });
 }
 

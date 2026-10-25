@@ -7,9 +7,9 @@ import type { Backends, Profile, Settings } from '../../../../shared/protocol';
 import type { ProfileSecrets } from '../secrets';
 import type { Platform } from '../system';
 import { charonArgs, charonCommand, charonDialect, detectCharon } from './charon';
-import { detectHelper, helperProcess } from './helper';
+import { bundledCore, detectHelper, helperProcess } from './helper';
 import { HELPER_PIPE } from './helper-script';
-import { detectOpenconnect, findVpncScript, openconnectArgs, openconnectDialect, withSudo } from './openconnect';
+import { ADAPTER, detectOpenconnect, findVpncScript, openconnectArgs, openconnectDialect, withSudo } from './openconnect';
 import { ProcessTunnel } from './process';
 import { detectRas, RasTunnel } from './ras';
 import type { Tunnel, TunnelHooks } from './types';
@@ -29,7 +29,8 @@ export async function detectBackends(settings: Settings, dataDir: string, platfo
   ]);
   if (platform === 'win32' && ssl.available && !elevated) {
     if (helper?.state !== 'running') ssl.note = 'Needs the FortiConnect VPN helper, or FortiConnect running as administrator';
-    else if (!inProgramFiles(ssl.path)) ssl.note = 'The VPN helper only runs an OpenConnect installed under Program Files';
+    // The helper runs its own copy of the OpenConnect FortiConnect ships, else one under Program Files.
+    else if (!bundledCore() && !inProgramFiles(ssl.path)) ssl.note = 'The VPN helper only runs the OpenConnect FortiConnect ships or one installed under Program Files';
     else ssl.note = 'Runs through the FortiConnect VPN helper';
   }
   return { ssl, ipsec, elevated, platform, helper };
@@ -65,11 +66,12 @@ export const createTunnel: TunnelFactory = (ctx) => {
       const cert = p.clientCert ? fs.readFileSync(p.clientCert).toString('base64') : undefined;
       const start = { gateway: p.gateway, port: p.port, realm: p.realm ? encodeURI(p.realm) : '', user: p.username, servercert: p.trustedCert ?? '', verbose, cert };
       const pipe = ctx.helperPipe ?? HELPER_PIPE;
-      return new ProcessTunnel({ file: 'openconnect', args: [], launch: () => helperProcess(start, pipe), username: p.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: [] });
+      return new ProcessTunnel({ file: 'openconnect', args: [], launch: () => helperProcess(start, pipe), device: ADAPTER.win32, username: p.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: [] });
     }
     const args = openconnectArgs({ profile: p, platform, verbose, vpncScript: findVpncScript(settings.vpncScript, b.path, platform) });
     const cmd = withSudo(b.path, args, platform, elevated);
-    return new ProcessTunnel({ ...cmd, username: p.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: ['openconnect', 'sudo'], stopSignal: 'SIGINT' });
+    const device = platform === 'win32' || platform === 'linux' ? ADAPTER[platform] : undefined;
+    return new ProcessTunnel({ ...cmd, device, username: p.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: ['openconnect', 'sudo'], stopSignal: 'SIGINT' });
   }
   if (platform === 'win32') {
     if (p.ike === 'ikev1') throw new Error("Windows' own VPN client has no IKEv1 + XAuth. Use IKEv2 or L2TP/IPsec for this profile (and enable it on the FortiGate), or connect with SSL-VPN.");

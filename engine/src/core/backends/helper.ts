@@ -6,7 +6,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import type { HelperInfo } from '../../../../shared/protocol';
-import { powershell, run } from '../system';
+import { powershell, run, sys32 } from '../system';
 import { errorMessage } from '../util';
 import { HELPER_DIR_NAME, HELPER_PIPE, HELPER_VERSION, installScript, removeScript } from './helper-script';
 import type { VpnProcess } from './process';
@@ -33,6 +33,12 @@ function openPipe(pipe: string, attempts = 6): Promise<net.Socket> {
     };
     attempt();
   });
+}
+
+/** The OpenConnect folder shipped with FortiConnect, when this build has one. */
+export function bundledCore(): string | null {
+  const d = process.env.FORTICONNECT_BUNDLED_CORE;
+  return d && fs.existsSync(path.join(d, 'openconnect.exe')) ? d : null;
 }
 
 function helperDir(): string {
@@ -82,7 +88,7 @@ export async function detectHelper(pipe = HELPER_PIPE): Promise<HelperInfo> {
 
 /** This Windows account's SID, read without elevation (the elevated copy may be another account: over-the-shoulder UAC). */
 export async function currentUserSid(): Promise<string> {
-  const r = await run('whoami', ['/user', '/fo', 'csv', '/nh'], 10_000);
+  const r = await run(sys32('whoami.exe'), ['/user', '/fo', 'csv', '/nh'], 10_000);
   const sid = /"(S-1-[0-9-]+)"/.exec(r.out)?.[1];
   if (!sid) throw new Error('Could not read your Windows account id');
   return sid;
@@ -95,7 +101,8 @@ export async function currentUserSid(): Promise<string> {
 async function runElevated(script: string): Promise<void> {
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   const outer = `try { $p = Start-Process -FilePath powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-EncodedCommand','${encoded}'; exit $p.ExitCode } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1223 }`;
-  const r = await powershell(outer, {}, 10 * 60_000);
+  // Too long for a command line once encoded again, and a single line: so on stdin.
+  const r = await powershell(outer, {}, 10 * 60_000, true);
   if (r.code === 1223) throw new Error(/cancel/i.test(r.err) ? 'Cancelled' : r.err.trim() || 'Could not get administrator rights');
   if (r.code !== 0) {
     let detail = '';
@@ -108,9 +115,10 @@ async function runElevated(script: string): Promise<void> {
   }
 }
 
-/** Install or update the helper, then wait for it to answer (the task starts it within a few seconds). */
-export async function installHelper(pipe = HELPER_PIPE): Promise<HelperInfo> {
-  await runElevated(installScript(await currentUserSid()));
+/** Install or update the helper, then wait for it to answer (the task starts it within a few seconds). The OpenConnect
+ * FortiConnect ships (FORTICONNECT_BUNDLED_CORE, set by the desktop app) goes with it. */
+export async function installHelper(pipe = HELPER_PIPE, bundledOpenConnect = bundledCore()): Promise<HelperInfo> {
+  await runElevated(installScript(await currentUserSid(), bundledOpenConnect));
   const until = Date.now() + 30_000;
   let info = await detectHelper(pipe);
   // PowerShell compiles the helper when it starts: give it time.

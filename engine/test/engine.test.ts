@@ -22,7 +22,8 @@ import { certPin, checkGateway } from '../src/core/net';
 import { buildLink, normalizeConfig, parseLink, parseLinks, profileKey } from '../src/core/profiles';
 import { SecretStore, seal, secretKey, unseal } from '../src/core/secrets';
 import { defaultSettings, mergeSettings } from '../src/core/settings';
-import { parseNetstat } from '../src/core/traffic';
+import { CounterWatcher, parseNetstat, type Counters } from '../src/core/traffic';
+import { powershell } from '../src/core/system';
 import { createServer, ENGINE_VERSION } from '../src/http/server';
 
 const FIXTURES = path.join(import.meta.dirname, 'fixtures');
@@ -550,7 +551,36 @@ describe('Windows VPN helper', { skip: process.platform !== 'win32' }, () => {
   });
 });
 
+// Regressions: PowerShell quits without running a multi-line script piped to its stdin, which left the traffic counter
+// (and Windows' IPsec setup) silently doing nothing, and the traffic showing 0 B/s.
+describe('PowerShell on Windows', { skip: process.platform !== 'win32' }, () => {
+  test('a multi-line script runs, with values from the environment', async () => {
+    const r = await powershell("$a = $env:FC_TEST\nif ($a -eq 'x') {\n  Write-Output 'ran'\n}\n", { FC_TEST: 'x' });
+    assert.equal(r.code, 0);
+    assert.equal(r.out.trim(), 'ran');
+  });
+
+  test('the traffic counter reads a real adapter', async () => {
+    const name = Object.entries(os.networkInterfaces()).find(([n, a]) => !/loopback/i.test(n) && a?.some((x) => !x.internal))?.[0];
+    assert.ok(name, 'no network adapter to read');
+    const w = new CounterWatcher('win32');
+    const sample = await new Promise<Counters | null>((resolve) => {
+      const t = setTimeout(() => resolve(null), 15_000);
+      w.start(name, (c) => {
+        clearTimeout(t);
+        resolve(c);
+      });
+    });
+    w.stop();
+    assert.ok(sample && sample.rx >= 0 && sample.tx >= 0, `no counters for "${name}"`);
+  });
+});
+
 test('the elevated install script embeds the helper and only takes a real account id', () => {
+  // The OpenConnect FortiConnect ships is copied next to the helper; a path that could break out of the quotes is refused.
+  assert.match(installScript('S-1-5-21-1-2-3-1001', 'C:\\Users\\a\\AppData\\Local\\Programs\\FortiConnect\\resources\\core'), /\$from = 'C:\\Users\\a\\AppData\\Local\\Programs\\FortiConnect\\resources\\core'[\s\S]*Copy-Item -Destination \$oc/);
+  assert.throws(() => installScript('S-1-5-21-1-2-3-1001', "C:\\x'; Remove-Item C:\\ -Recurse; '"), /Unusual characters/);
+  assert.doesNotMatch(installScript('S-1-5-21-1-2-3-1001'), /Copy-Item/);
   const s = installScript('S-1-5-21-1-2-3-1001');
   assert.match(s, /Register-ScheduledTask/);
   assert.match(s, /'S-1-5-21-1-2-3-1001'/);

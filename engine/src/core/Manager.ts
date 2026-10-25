@@ -262,6 +262,8 @@ export class Manager extends EventEmitter {
 
   /** Windows: install or update the VPN helper (one administrator prompt), so SSL-VPN works without elevation. */
   async installHelper(): Promise<Backends> {
+    // Installing restarts the helper, which ends the tunnel it runs.
+    if (this.connection.status === 'connected' && !this.elevated) throw new Error('Disconnect first: the connection runs through the helper');
     return this.helperStep('install');
   }
 
@@ -513,7 +515,18 @@ export class Manager extends EventEmitter {
     try {
       if (profile.type === 'ssl') {
         // The helper may have started (or stopped) since the last look: it decides how SSL-VPN runs here.
-        if (this.platform === 'win32' && !this.elevated) await this.refreshBackends();
+        if (this.platform === 'win32' && !this.elevated) {
+          await this.refreshBackends();
+          // Missing, stopped or older than this FortiConnect: install it now, so users never have to do it by hand.
+          // Windows shows its one administrator prompt, then the connection carries on.
+          const state = this.backends.helper?.state;
+          if (state && state !== 'running' && !this.opts.backends && this.backends.ssl.available) {
+            this.log('app', state === 'outdated' ? 'Updating the VPN helper first' : 'Installing the VPN helper first: SSL-VPN on Windows needs it once');
+            // An older helper still connects: if its update is declined, use it as it is.
+            if (state === 'outdated') await this.helperStep('install').catch((e) => this.log('warning', `The VPN helper was not updated (${errorMessage(e)}); using the installed one`));
+            else await this.helperStep('install');
+          }
+        }
         await this.settleCertificate(stored);
       }
       tunnel = this.makeTunnel({

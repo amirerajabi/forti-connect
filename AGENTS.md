@@ -15,6 +15,7 @@ Read [docs/STATUS.md](docs/STATUS.md) first: what works, what is unfinished.
 | `desktop/` | Electron main + preload. Starts the engine as a utility process (with the secrets key from `safeStorage`, `secret-key.ts`), the main window, the tray icon (follows the connection; left click opens the panel window from `tray-panel.ts`, right click the menu), restart as administrator (Windows), auto-updater. Packaging: `electron-builder.yml`; `desktop/core/` is shipped as `resources/core` when it holds an OpenConnect. Icons: `node build/make-icon.mjs`. |
 | `shared/protocol.ts` | Wire types shared by engine, UI and desktop (types only). |
 | `scripts/run.mjs` | Dev launchers (`browser`, `desktop-dev`, `desktop`). |
+| `scripts/fetch-openconnect.mjs` | Puts the official OpenConnect Windows build (SHA-256 pinned) into `desktop/core` for the installer; the release workflow runs it. |
 | `scripts/check-i18n.mjs` | `npm run check:i18n`: every UI string has a Persian translation (CI runs it). |
 | `.github/workflows/` | `ci.yml` (typecheck, tests, i18n, UI build), `release.yml` (tag `v*` → installers → GitHub Release). |
 
@@ -58,6 +59,9 @@ Electron smoke run with a throwaway profile (PowerShell): set `FORTICONNECT_USER
 - Disconnect also cancels a question that is waiting and a connect in progress (it stops the tunnel first, then queues
   the cleanup); keep that, or a waiting prompt deadlocks the connect / disconnect queue.
 - Every engine behaviour change gets a test.
+- **Run Windows' own tools by full path** (`sys32('whoami.exe')`, `powershellExe()` in `system.ts`): a bare name follows
+  the PATH, where Git's or MSYS2's `whoami` / `tar` may come first. PowerShell scripts go as `-EncodedCommand`;
+  PowerShell quits without running a multi-line script piped to its stdin (that left traffic at 0 B/s in 0.2.0).
 - **Two languages.** English is the default; Persian turns the UI right-to-left. Write UI text in English through
   `t('…')` (or `useT()` in components) and add its Persian to `ui/src/i18n-fa.ts`. In CSS use logical properties
   (`margin-inline-start`, `inset-inline-end`, `text-align: start`), never left/right, except where the OS dictates

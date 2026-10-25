@@ -71,6 +71,8 @@ export interface ProcessSpec {
   secrets: ProfileSecrets;
   dialect: Dialect;
   hooks: TunnelHooks;
+  /** The adapter the program was told to use, for traffic when the system has not shown its address yet. */
+  device?: string;
   /** Names the process may show under, to recognise it after a crash. */
   names: string[];
   /** POSIX: SIGINT lets OpenConnect log out and undo its routes. Windows has no signals: the process is ended. */
@@ -135,7 +137,7 @@ export class ProcessTunnel implements Tunnel {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
-        this.info.device ??= deviceFor(this.info.address);
+        this.info.device ??= deviceFor(this.info.address) ?? this.s.device ?? null;
         resolve({ ...this.info });
       };
       this.onCancel = () => fail('Cancelled');

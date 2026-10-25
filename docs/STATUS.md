@@ -1,9 +1,27 @@
 # Status
 
-Released: 0.2.0 (tag v0.2.0, 2026-10-25), at https://github.com/amirerajabi/forti-connect. Before it: 0.1.1 and 0.1.0
-(the first release), the same day. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
+Released: 0.3.0 (tag v0.3.0, 2026-10-25), at https://github.com/amirerajabi/forti-connect. Before it: 0.2.0, 0.1.1 and
+0.1.0 (the first release), the same day. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.3.0
+
+- **SSL-VPN connected and worked for the user through the helper** (FortiConnect 0.2.0, their real gateway, a full
+  login): the first real connection.
+- **Traffic showed 0 B/s:** the Windows counter's PowerShell loop went to PowerShell on stdin, and PowerShell quits
+  without running a multi-line script piped to it. Scripts now go as `-EncodedCommand` (Windows' IPsec setup scripts
+  had the same problem and were likely silently failing). Checked against the live tunnel: samples every second.
+  The tunnel also falls back to the adapter name FortiConnect chose when the system has not shown the VPN address yet.
+- **OpenConnect ships inside the Windows installer** (`scripts/fetch-openconnect.mjs`, official v9.21 build, SHA-256
+  pinned; checked in a local unpacked build: 18 files in `resources/core`, the engine picks that copy first).
+- **Helper v2** copies that OpenConnect into `C:\Program Files\FortiConnect Helper\openconnect` (admin-only) and runs
+  it first. Checked here: v1 → v2 update, the copy in place, a connection to the real gateway through it up to
+  `Password:` (helper.log names the copy).
+- **The first SSL-VPN connect installs (or updates) the helper itself**; a declined update falls back to the older helper.
+- Windows' own tools are run by full path (`whoami` resolved to Git's and broke the helper install from a Git shell).
+- Installing the helper from Settings is refused while connected (it restarts the helper and would end the tunnel; the
+  developer's test update did end the user's connection once).
 
 ## In 0.2.0
 

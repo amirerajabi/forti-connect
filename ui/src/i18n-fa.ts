@@ -228,8 +228,7 @@ export const FA: Record<string, string> = {
   'charon-cmd program': 'برنامه‌ی charon-cmd',
   'Look again': 'جستجوی دوباره',
   'Could not look for the VPN programs': 'جستجوی برنامه‌های VPN ممکن نشد',
-  'Windows: install OpenConnect for Windows (openconnect.exe with wintun.dll next to it), for example from MSYS2: pacman -S mingw-w64-ucrt-x86_64-openconnect. IPsec needs nothing: FortiConnect uses Windows’ own VPN client.':
-    'ویندوز: OpenConnect برای ویندوز را نصب کنید (openconnect.exe همراه با wintun.dll کنار آن)، مثلاً از MSYS2: pacman -S mingw-w64-ucrt-x86_64-openconnect. IPsec چیزی لازم ندارد: FortiConnect از VPN داخلی ویندوز استفاده می‌کند.',
+  'Windows: OpenConnect comes with FortiConnect, nothing to install. To use another copy, choose its openconnect.exe above. IPsec uses Windows’ own VPN client.': 'ویندوز: OpenConnect همراه FortiConnect نصب می‌شود و نیازی به نصب جداگانه نیست. برای استفاده از نسخه‌ای دیگر، فایل openconnect.exe آن را در بالا انتخاب کنید. IPsec از برنامه‌ی VPN خود ویندوز استفاده می‌کند.',
   'macOS: brew install openconnect strongswan': 'macOS: brew install openconnect strongswan',
   'Linux: sudo apt install openconnect strongswan-charon (or your distribution’s openconnect and charon-cmd packages).': 'لینوکس: sudo apt install openconnect strongswan-charon (یا بسته‌های openconnect و charon-cmd توزیع خودتان).',
   'Could not save the setting': 'ذخیره‌ی تنظیم ممکن نشد',
@@ -279,7 +278,7 @@ export const FA: Record<string, string> = {
   'Could not remove the VPN helper': 'حذف دستیار VPN ممکن نشد',
   'A newer VPN helper comes with this FortiConnect. Update it (Windows asks for administrator rights once).': 'این نسخه‌ی FortiConnect دستیار VPN تازه‌تری دارد. آن را به‌روز کنید (ویندوز یک بار دسترسی مدیر می‌خواهد).',
   'The VPN helper is installed but not running. It starts with Windows; install it again if it stays stopped.': 'دستیار VPN نصب است اما اجرا نمی‌شود. با ویندوز اجرا می‌شود؛ اگر همچنان متوقف ماند، دوباره نصبش کنید.',
-  'SSL-VPN on Windows needs the FortiConnect VPN helper. Install it once (Windows asks for administrator rights), then FortiConnect works without them.': 'SSL-VPN در ویندوز به دستیار VPN برنامه‌ی FortiConnect نیاز دارد. یک بار نصبش کنید (ویندوز دسترسی مدیر می‌خواهد)، پس از آن FortiConnect بدون آن کار می‌کند.',
+  'SSL-VPN on Windows uses the FortiConnect VPN helper. It installs itself the first time you connect: Windows asks for administrator rights once.': 'SSL-VPN در ویندوز از دستیار VPN برنامه‌ی FortiConnect استفاده می‌کند. بار اولی که وصل شوید خودش نصب می‌شود: ویندوز یک بار دسترسی مدیر می‌خواهد.',
   'Update the VPN helper': 'به‌روزرسانی دستیار VPN',
   'VPN helper': 'دستیار VPN',
   'It runs as SYSTEM from C:\\Program Files\\FortiConnect Helper, only for your Windows account, and only starts the OpenConnect installed under Program Files.': 'از پوشه‌ی C:\\Program Files\\FortiConnect Helper با دسترسی SYSTEM اجرا می‌شود، فقط برای حساب ویندوز شما، و فقط OpenConnect نصب‌شده در Program Files را اجرا می‌کند.',

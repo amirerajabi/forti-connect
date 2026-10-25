@@ -2,7 +2,8 @@ name: Release
 
 # Push a tag like v1.0.0 (matching desktop/package.json) to build the Windows installer, the macOS DMG/ZIP and the Linux
 # AppImage on their native runners and publish them as a GitHub Release with docs/release-notes/<tag>.md. Same flow as
-# Grabbit's. OpenConnect and strongSwan are not bundled: the app finds an installed copy (Settings → VPN programs).
+# Grabbit's. The Windows installer ships OpenConnect (scripts/fetch-openconnect.mjs); on macOS and Linux the app finds an
+# installed copy (Settings → VPN programs).
 on:
   push:
     tags: ['v*']
@@ -64,6 +65,11 @@ jobs:
           npm ci --prefix desktop
       - name: Build engine, UI and desktop shell
         run: npm run build
+      # Windows users get OpenConnect inside the installer (the official build, pinned by SHA-256); macOS and Linux
+      # install it from brew / apt, since there it needs the system's own libraries.
+      - name: Bundle OpenConnect (Windows)
+        if: runner.os == 'Windows'
+        run: node scripts/fetch-openconnect.mjs desktop/core
       - name: Package
         working-directory: desktop
         run: npx electron-builder ${{ matrix.target }} --publish never

@@ -17,7 +17,7 @@
 import { gzipSync } from 'node:zlib';
 
 /** Bump when the helper changes: an older one installed on a computer is offered as an update. */
-export const HELPER_VERSION = 1;
+export const HELPER_VERSION = 2;
 export const HELPER_PIPE = '\\\\.\\pipe\\forticonnect-helper';
 export const HELPER_TASK = 'FortiConnect VPN helper';
 export const HELPER_DIR_NAME = 'FortiConnect Helper';
@@ -39,12 +39,14 @@ public static class FcHelper {
   public const int Version = ${HELPER_VERSION};
   static string pipeName;
   static string workDir;
+  static string home;
   static string testCommand;
   static List<SecurityIdentifier> allowed = new List<SecurityIdentifier>();
   static readonly object busy = new object();
   static Process current;
 
-  public static void Run(string pipe, string users, string test, string work) {
+  public static void Run(string pipe, string users, string test, string work, string helperHome) {
+    home = helperHome;
     pipeName = pipe;
     testCommand = test;
     workDir = work;
@@ -171,6 +173,11 @@ public static class FcHelper {
   }
 
   static string FindOpenConnect() {
+    // The copy FortiConnect ships, put next to the helper when it was installed (as admin-only as the helper itself).
+    if (!string.IsNullOrEmpty(home)) {
+      string own = Path.Combine(Path.Combine(home, "openconnect"), "openconnect.exe");
+      if (File.Exists(own)) return own;
+    }
     List<string> dirs = new List<string>();
     foreach (string env in new[] { "ProgramFiles", "ProgramW6432", "ProgramFiles(x86)" }) {
       string d = Environment.GetEnvironmentVariable(env);
@@ -182,7 +189,7 @@ public static class FcHelper {
         if (File.Exists(p)) return p;
       }
     }
-    throw new Exception("OpenConnect is not installed under Program Files (the VPN helper only runs a copy there)");
+    throw new Exception("OpenConnect was not found: neither the copy FortiConnect ships nor one under Program Files");
   }
 
   static Process Start(Dictionary<string, object> m, Conn conn, out string certFile) {
@@ -301,7 +308,7 @@ if (Test-Path $usersFile) { $users = Get-Content $usersFile -Raw }
 Add-Type -ReferencedAssemblies System.Core, System.Web.Extensions -TypeDefinition @'
 ${CSHARP}
 '@
-[FcHelper]::Run($PipeName, $users, $TestCommand, $WorkDir)
+[FcHelper]::Run($PipeName, $users, $TestCommand, $WorkDir, $PSScriptRoot)
 `;
 
 /**
@@ -309,8 +316,20 @@ ${CSHARP}
  * users.txt, and (re)register the SYSTEM task that starts it at boot. Sent as -EncodedCommand, not as a file, so nothing
  * on disk can be swapped between the user's consent and the copy. Errors land in work\install-error.txt.
  */
-export function installScript(userSid: string): string {
+export function installScript(userSid: string, bundledOpenConnect: string | null = null): string {
   if (!/^S-1-[0-9-]+$/.test(userSid)) throw new Error('Could not read your Windows account id');
+  if (bundledOpenConnect !== null && !/^[^'"`$\r\n]+$/.test(bundledOpenConnect)) throw new Error('Unusual characters in the OpenConnect folder path');
+  // The OpenConnect FortiConnect ships: copied next to the helper, where only administrators can change it.
+  const copyOpenConnect = bundledOpenConnect
+    ? `  $from = '${bundledOpenConnect}'
+  if (Test-Path (Join-Path $from 'openconnect.exe')) {
+    $oc = Join-Path $dir 'openconnect'
+    if (Test-Path $oc) { Remove-Item -Recurse -Force $oc }
+    New-Item -ItemType Directory -Force -Path $oc | Out-Null
+    Get-ChildItem -Path $from -File | Where-Object { $_.Extension -in '.exe', '.dll', '.js', '.txt' } | Copy-Item -Destination $oc
+  }
+`
+    : '';
   // Gzipped: the whole script travels as -EncodedCommand, and Windows caps a command line at 32767 characters.
   const b64 = gzipSync(Buffer.from(HELPER_PS1, 'utf8'), { level: 9 }).toString('base64');
   return `$ErrorActionPreference = 'Stop'
@@ -331,7 +350,7 @@ try {
   if (Test-Path $usersFile) { $users = @(Get-Content $usersFile | Where-Object { $_ -match '^S-1-[0-9-]+$' }) }
   if ($users -notcontains '${userSid}') { $users += '${userSid}' }
   Set-Content -Path $usersFile -Value $users -Encoding ASCII
-  $ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+${copyOpenConnect}  $ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'
   $action = New-ScheduledTaskAction -Execute $ps -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $script + '"')
   $trigger = New-ScheduledTaskTrigger -AtStartup
   $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest

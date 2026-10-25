@@ -11,8 +11,11 @@
   that all three exist, name this version and point at uploaded files. Never remove those checks.
 - **A version that shipped is never rebuilt under the same number.** Installed copies compare versions, not checksums.
   Fix forward with the next patch version.
-- **VPN programs are not bundled:** OpenConnect and strongSwan are found on the user's computer. A local Windows build
-  can ship OpenConnect by filling `desktop/core` (shipped as `resources/core`); the release workflow leaves it empty.
+- **The Windows installer ships OpenConnect:** the release workflow runs `scripts/fetch-openconnect.mjs`, which puts the
+  OpenConnect project's own Windows build (pinned by SHA-256) into `desktop/core` (shipped as `resources/core`). To move
+  to a newer OpenConnect, change its version and hash there and bump `HELPER_VERSION` so installed helpers take the new
+  copy. macOS and Linux users install OpenConnect / strongSwan themselves. Locally `desktop/core` stays empty (git
+  ignores it) unless you run the script.
 - **Unsigned builds:** SmartScreen warns on Windows and macOS cannot auto-install (the updater only announces). The
   release notes say how to get past the warnings.
 - **Publishing is public:** push, tag and release only when the user asked in this session. A release can be hidden with

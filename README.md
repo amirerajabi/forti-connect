@@ -28,7 +28,7 @@ FortiConnect is not made by or affiliated with Fortinet. FortiGate and FortiClie
 
 | | SSL-VPN | IPsec |
 | --- | --- | --- |
-| Windows | `openconnect.exe` with `wintun.dll` (for example MSYS2: `pacman -S mingw-w64-ucrt-x86_64-openconnect`), and, once, the **FortiConnect VPN helper** (one administrator prompt; afterwards FortiConnect runs as a normal user) | Nothing. The FortiGate tunnel must allow IKEv2 or L2TP (Windows has no IKEv1 + XAuth). |
+| Windows | Nothing: OpenConnect comes inside the installer, and the **FortiConnect VPN helper** installs itself the first time you connect (one administrator prompt; afterwards FortiConnect runs as a normal user) | Nothing. The FortiGate tunnel must allow IKEv2 or L2TP (Windows has no IKEv1 + XAuth). |
 | macOS | `brew install openconnect` | `brew install strongswan` |
 | Linux | `sudo apt install openconnect` | `sudo apt install strongswan-charon` (or your distribution's `charon-cmd`) |
 
@@ -66,8 +66,8 @@ npm run build
 npm run dist         # Windows installer into desktop/release/
 ```
 
-To ship OpenConnect inside the Windows installer, put `openconnect.exe`, its DLLs, `wintun.dll` and
-`vpnc-script-win.js` in `desktop/core/` before `npm run dist`.
+To ship OpenConnect inside a local Windows build as the release does, run `node scripts/fetch-openconnect.mjs` (it fills
+`desktop/core/` with the official build, checked by SHA-256) before `npm run dist`.
 
 See [AGENTS.md](AGENTS.md) for the layout and conventions, and [docs/STATUS.md](docs/STATUS.md) for what is verified.
 

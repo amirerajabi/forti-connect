@@ -162,7 +162,7 @@ function BackendNotice({ profile }: { profile: Profile }) {
             ? t('A newer VPN helper comes with this FortiConnect. Update it (Windows asks for administrator rights once).')
             : helper?.state === 'stopped'
               ? t('The VPN helper is installed but not running. It starts with Windows; install it again if it stays stopped.')
-              : t('SSL-VPN on Windows needs the FortiConnect VPN helper. Install it once (Windows asks for administrator rights), then FortiConnect works without them.')}
+              : t('SSL-VPN on Windows uses the FortiConnect VPN helper. It installs itself the first time you connect: Windows asks for administrator rights once.')}
         </span>
         <button className="btn btn-xs btn-primary" disabled={!!helper?.busy} onClick={() => runCommand('helper.install')}>
           {helper?.busy ? <LoaderCircle size={14} className="spin" /> : <ShieldCheck size={14} />} {outdated ? t('Update the VPN helper') : t('Install the VPN helper')}

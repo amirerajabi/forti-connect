@@ -4,7 +4,7 @@
 // the pre-shared key does not stay behind in Windows' settings.
 import type { BackendInfo, ProfileConfig } from '../../../../shared/protocol';
 import type { ProfileSecrets } from '../secrets';
-import { powershell, run } from '../system';
+import { powershell, run, sys32 } from '../system';
 import type { Leftover, PromptRequest, Tunnel, TunnelHooks, TunnelUp } from './types';
 
 export function detectRas(): BackendInfo {
@@ -109,7 +109,7 @@ export class RasTunnel implements Tunnel {
     this.log(`Dialing ${p.gateway}`);
     // rasdial takes the password on its command line; it is only visible to this user's own processes for a moment.
     this.dialed = true;
-    const r = await run('rasdial', [this.name, p.username, password], 90_000);
+    const r = await run(sys32('rasdial.exe'), [this.name, p.username, password], 90_000);
     if (r.code !== 0) {
       this.dialed = false;
       await powershell(REMOVE_SCRIPT, { FC_NAME: this.name });
@@ -125,7 +125,7 @@ export class RasTunnel implements Tunnel {
   private watch(): void {
     this.monitor = setInterval(async () => {
       if (this.stopping) return;
-      const r = await run('rasdial', [], 10_000);
+      const r = await run(sys32('rasdial.exe'), [], 10_000);
       if (this.stopping || r.code !== 0) return;
       if (!r.out.split(/\r?\n/).some((l) => l.trim() === this.name)) {
         this.stopWatching();
@@ -152,6 +152,6 @@ export class RasTunnel implements Tunnel {
 
 /** Hang up and remove an entry (also one a crash left behind). */
 export async function disconnectRas(name: string): Promise<void> {
-  await run('rasdial', [name, '/disconnect'], 30_000);
+  await run(sys32('rasdial.exe'), [name, '/disconnect'], 30_000);
   await powershell(REMOVE_SCRIPT, { FC_NAME: name });
 }

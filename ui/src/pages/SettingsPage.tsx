@@ -204,7 +204,7 @@ function BackendCard({ title, info }: { title: string; info: BackendInfo }) {
 }
 
 const INSTALL_HINT: Record<'win32' | 'darwin' | 'linux', string> = {
-  win32: 'Windows: install OpenConnect for Windows (openconnect.exe with wintun.dll next to it), for example from MSYS2: pacman -S mingw-w64-ucrt-x86_64-openconnect. IPsec needs nothing: FortiConnect uses Windows’ own VPN client.',
+  win32: 'Windows: OpenConnect comes with FortiConnect, nothing to install. To use another copy, choose its openconnect.exe above. IPsec uses Windows’ own VPN client.',
   darwin: 'macOS: brew install openconnect strongswan',
   linux: 'Linux: sudo apt install openconnect strongswan-charon (or your distribution’s openconnect and charon-cmd packages).',
 };

@@ -3,7 +3,7 @@
 // than the reading). Tunnels without an adapter of their own (strongSwan's kernel IPsec on Linux) have no counters.
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
-import type { Platform } from './system';
+import { powershellExe, type Platform } from './system';
 
 export interface Counters {
   rx: number;
@@ -38,7 +38,8 @@ export class CounterWatcher {
   start(device: string, onSample: (c: Counters) => void): void {
     this.stop();
     if (this.platform === 'win32') {
-      const ps = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '-'], { windowsHide: true, env: { ...process.env, FC_DEVICE: device } });
+      // -EncodedCommand, not the script on stdin: PowerShell quits without running a multi-line script piped to it.
+      const ps = spawn(powershellExe(), ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(WIN_LOOP, 'utf16le').toString('base64')], { windowsHide: true, env: { ...process.env, FC_DEVICE: device } });
       this.ps = ps;
       let buf = '';
       ps.stdout.on('data', (d: Buffer) => {
@@ -51,7 +52,6 @@ export class CounterWatcher {
         }
       });
       ps.on('error', () => undefined);
-      ps.stdin.end(WIN_LOOP);
       return;
     }
     const read = this.platform === 'linux' ? () => readSys(device) : () => readNetstat(device);
