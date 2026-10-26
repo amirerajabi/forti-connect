@@ -1,9 +1,28 @@
 # Status
 
-Released: 0.4.0 (tag v0.4.0, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
+Released: 0.5.0 (tag v0.5.0, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
 0.1.0 (the first release), all on 2026-10-25. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.5.0: IPsec IKEv2 carries traffic (step 2 of 3)
+
+- **The user's real login with 0.4.0 worked** (2026-10-26): PSK proof, EAP-MSCHAPv2, final AUTH; VPN address
+  192.168.4.11, DNS 217.218.127.127 / 217.218.155.155, all traffic (TSr 0.0.0.0-255.255.255.255), ESP AES-256 SHA256.
+- `ikev2/esp.ts`: ESP tunnel mode in UDP (AES-CBC + HMAC-SHA2, 64-packet replay window), on the IKE socket so it follows
+  the same NAT mapping. The IKE session now answers the gateway's INFORMATIONAL requests (liveness, DELETE; a
+  CREATE_CHILD_SA is refused with NO_ADDITIONAL_SAS until rekeying exists), sends NAT keepalives every 20 s, and checks
+  the gateway itself after 30 s of silence.
+- **Helper v4** has a `tun` operation: it opens or creates the "FortiConnect" Wintun adapter from its own copy of
+  `wintun.dll`, runs OpenConnect's `vpnc-script-win.js` (connect / disconnect) with the address, DNS, gateway route,
+  MTU 1400 and split networks, then passes IP packets over the pipe as length-prefixed frames. Every field is checked in
+  C#. The C# is installed without comment lines (the install script travels in a command line, near Windows' 32767
+  limit; a test checks the size).
+- Windows IKEv2 profiles need the helper (installed or updated on connect, one UAC prompt).
+- Tested: ESP round trips, replays, tampering; a whole connection against the fake gateway with a stand-in adapter
+  (packets both ways, IPv6 held back, the gateway's liveness check answered, its DELETE noticed); the real helper script
+  in `tun-echo` test mode (framing both ways, a bad address refused). **Not tested:** the real Wintun adapter and
+  vpnc-script from the helper, and any traffic through the real gateway; rekeying (child SA after 43200 s) is step 3.
 
 ## In 0.4.0: IPsec IKEv2 on Windows with FortiConnect's own engine (step 1 of 3)
 

@@ -527,22 +527,23 @@ export class Manager extends EventEmitter {
     this.log('app', `Connecting to ${profile.name}: ${profile.type === 'ssl' ? 'SSL-VPN' : 'IPsec'} ${target}`);
     let tunnel: Tunnel | null = null;
     try {
-      if (profile.type === 'ssl') {
-        // The helper may have started (or stopped) since the last look: it decides how SSL-VPN runs here.
-        if (this.platform === 'win32' && !this.elevated) {
-          await this.refreshBackends();
-          // Missing, stopped or older than this FortiConnect: install it now, so users never have to do it by hand.
-          // Windows shows its one administrator prompt, then the connection carries on.
-          const state = this.backends.helper?.state;
-          if (state && state !== 'running' && !this.opts.backends && this.backends.ssl.available) {
-            this.log('app', state === 'outdated' ? 'Updating the VPN helper first' : 'Installing the VPN helper first: SSL-VPN on Windows needs it once');
-            // An older helper still connects: if its update is declined, use it as it is.
-            if (state === 'outdated') await this.helperStep('install').catch((e) => this.log('warning', `The VPN helper was not updated (${errorMessage(e)}); using the installed one`));
-            else await this.helperStep('install');
-          }
+      // On Windows the VPN helper runs SSL-VPN without administrator rights, and always owns the adapter of FortiConnect's
+      // own IPsec engine (IKEv2).
+      const ikev2 = profile.type === 'ipsec' && profile.ike === 'ikev2';
+      if (this.platform === 'win32' && ((profile.type === 'ssl' && !this.elevated) || ikev2)) {
+        // The helper may have started (or stopped) since the last look.
+        await this.refreshBackends();
+        // Missing, stopped or older than this FortiConnect: install it now, so users never have to do it by hand.
+        // Windows shows its one administrator prompt, then the connection carries on.
+        const state = this.backends.helper?.state;
+        if (state && state !== 'running' && !this.opts.backends && (ikev2 || this.backends.ssl.available)) {
+          this.log('app', state === 'outdated' ? 'Updating the VPN helper first' : 'Installing the VPN helper first: Windows needs it once');
+          // An older helper still runs OpenConnect: if its update is declined, use it as it is. IPsec needs the new one.
+          if (state === 'outdated' && !ikev2) await this.helperStep('install').catch((e) => this.log('warning', `The VPN helper was not updated (${errorMessage(e)}); using the installed one`));
+          else await this.helperStep('install');
         }
-        await this.settleCertificate(stored);
       }
+      if (profile.type === 'ssl') await this.settleCertificate(stored);
       tunnel = this.makeTunnel({
         profile: this.view(stored),
         secrets: this.secrets.get(profile.id),

@@ -142,6 +142,15 @@ export class IkeSession {
   private idiBody = Buffer.alloc(0);
   private pending: { resolve: (b: Buffer) => void; match: (b: Buffer) => boolean } | null = null;
   private closed = false;
+  // ---- after the login: the gateway's own requests, liveness, and ESP on the same socket
+  private peerMessageId = -1;
+  private lastPeerResponse: Buffer | null = null;
+  private lastHeard = Date.now();
+  private timers: NodeJS.Timeout[] = [];
+  private checking = false;
+  private espHandler: ((data: Buffer) => void) | null = null;
+  private goneHandler: ((reason: string) => void) | null = null;
+  private childSpiIn: Buffer | null = null;
 
   constructor(private readonly o: IkeOptions) {}
 
@@ -177,19 +186,75 @@ export class IkeSession {
 
   close(): void {
     this.closed = true;
+    for (const t of this.timers) clearInterval(t);
+    this.timers = [];
     this.socket?.close();
     this.socket = null;
+  }
+
+  /**
+   * Keep the established tunnel going: ESP packets from the gateway go to `onEsp`; the gateway's liveness checks are
+   * answered; a NAT keepalive goes out every 20 s; when nothing has come from the gateway for 30 s FortiConnect asks it
+   * itself (an empty INFORMATIONAL), and `onGone` hears when the gateway ends the tunnel or stops answering.
+   */
+  keepAlive(onEsp: (data: Buffer) => void, onGone: (reason: string) => void, o: { keepaliveMs?: number; idleMs?: number } = {}): void {
+    this.espHandler = onEsp;
+    this.goneHandler = onGone;
+    this.lastHeard = Date.now();
+    if (this.natT) this.timers.push(setInterval(() => this.socket?.send(Buffer.from([0xff]), this.remotePort, this.remoteAddress), o.keepaliveMs ?? 20_000));
+    const idle = o.idleMs ?? 30_000;
+    this.timers.push(
+      setInterval(() => {
+        if (this.checking || this.closed || Date.now() - this.lastHeard < idle) return;
+        this.checking = true;
+        this.messageId++;
+        const id = this.messageId;
+        this.request(this.encrypted(EXCHANGE.INFORMATIONAL, []), EXCHANGE.INFORMATIONAL, id).then(
+          () => {
+            this.checking = false;
+            this.lastHeard = Date.now();
+          },
+          (e: Error) => {
+            this.checking = false;
+            if (!this.closed && e.message !== 'Cancelled') this.gone('The FortiGate stopped answering (dead peer detection)');
+          },
+        );
+      }, Math.min(10_000, idle)),
+    );
+  }
+
+  /** An ESP packet to the gateway, on the IKE socket so it follows the same NAT mapping. */
+  sendEsp(data: Buffer): void {
+    this.socket?.send(data, this.remotePort, this.remoteAddress);
+  }
+
+  private gone(reason: string): void {
+    const h = this.goneHandler;
+    this.goneHandler = null;
+    this.o.log(reason);
+    h?.(reason);
   }
 
   private onMessage(msg: Buffer, rinfo: dgram.RemoteInfo): void {
     if (rinfo.address !== this.remoteAddress) return;
     let ike = msg;
     if (rinfo.port === (this.o.natPort ?? 4500) && this.natT) {
-      // NAT-T: IKE behind a zero marker; anything else on 4500 is ESP, which the data path handles.
-      if (msg.length < 4 || !msg.subarray(0, 4).equals(NON_ESP_MARKER)) return;
+      // NAT-T: IKE behind a zero marker; a single 0xFF byte is a keepalive; anything else on 4500 is ESP.
+      if (msg.length === 1 && msg[0] === 0xff) return;
+      if (msg.length < 4 || !msg.subarray(0, 4).equals(NON_ESP_MARKER)) {
+        this.lastHeard = Date.now();
+        this.espHandler?.(msg);
+        return;
+      }
       ike = msg.subarray(4);
     }
     if (ike.length < HEADER_LENGTH || !ike.subarray(0, 8).equals(this.spiI)) return;
+    this.lastHeard = Date.now();
+    const flags = ike[19];
+    if ((flags & FLAG.RESPONSE) === 0) {
+      if (this.keys && this.goneHandler) this.answer(ike);
+      return;
+    }
     if (this.pending?.match(ike)) {
       const p = this.pending;
       this.pending = null;
@@ -328,14 +393,48 @@ export class IkeSession {
 
   // ---------------------------------------------------------------- IKE_AUTH
 
-  private encrypted(exchange: number, payloads: Payload[]): Buffer {
+  /** A request from the gateway (a liveness check, a DELETE, a rekey): answered as RFC 7296 §2.2 asks. */
+  private answer(msg: Buffer): void {
+    const h = decodeHeader(msg);
+    if (h.messageId === this.peerMessageId && this.lastPeerResponse) return this.send(this.lastPeerResponse);
+    if (h.messageId !== this.peerMessageId + 1) return;
+    let ps: Payload[];
+    try {
+      ps = this.open_(msg);
+    } catch {
+      return;
+    }
+    this.peerMessageId = h.messageId;
+    const reply: Payload[] = [];
+    let ended: string | null = null;
+    if (h.exchange === EXCHANGE.INFORMATIONAL) {
+      for (const d of ps.filter((p) => p.type === PAYLOAD.DELETE)) {
+        if (d.body[0] === PROTOCOL.IKE) ended = 'The FortiGate ended the IPsec tunnel';
+        else if (d.body[0] === PROTOCOL.ESP && this.childSpiIn) {
+          // Answer with our side of the deleted child SA (§1.4.1).
+          const body = Buffer.concat([Buffer.from([PROTOCOL.ESP, 4, 0, 1]), this.childSpiIn]);
+          reply.push({ type: PAYLOAD.DELETE, critical: false, body });
+          ended = 'The FortiGate ended the IPsec tunnel';
+        }
+      }
+    } else if (h.exchange === EXCHANGE.CREATE_CHILD_SA) {
+      // Rekeying comes later: say no, and the gateway keeps the current keys until they expire.
+      this.o.log('The FortiGate asked for new IPsec keys; FortiConnect cannot rekey yet');
+      reply.push({ type: PAYLOAD.NOTIFY, critical: false, body: encodeNotify({ type: NOTIFY.NO_ADDITIONAL_SAS }) });
+    }
+    this.lastPeerResponse = this.encrypted(h.exchange, reply, FLAG.INITIATOR | FLAG.RESPONSE, h.messageId);
+    this.send(this.lastPeerResponse);
+    if (ended) this.gone(ended);
+  }
+
+  private encrypted(exchange: number, payloads: Payload[], flags: number = FLAG.INITIATOR, messageId = this.messageId): Buffer {
     const s = this.suite!;
     const k = this.keys!;
     const inner = encodePayloads(payloads);
     const body = encryptSk(s, k.skEi, inner);
     const icvLen = INTEG[s.integ].icvLength;
     const total = HEADER_LENGTH + 4 + body.length + icvLen;
-    const header = encodeHeader({ spiI: this.spiI, spiR: this.spiR, next: PAYLOAD.SK, exchange, flags: FLAG.INITIATOR, messageId: this.messageId }, total);
+    const header = encodeHeader({ spiI: this.spiI, spiR: this.spiR, next: PAYLOAD.SK, exchange, flags, messageId }, total);
     const sk = Buffer.from([payloads[0]?.type ?? PAYLOAD.NONE, 0, 0, 0]);
     sk.writeUInt16BE(4 + body.length + icvLen, 2);
     const unsigned = Buffer.concat([header, sk, body]);
@@ -441,6 +540,7 @@ export class IkeSession {
     if (!integ || !INTEG[integ] || !encr || encr.id !== ENCR_AES_CBC) throw new IkeError('The gateway chose ESP algorithms this profile did not offer');
     const espSuite: Suite = { encr: { id: ENCR_AES_CBC, keyLength: (encr.keyLength ?? 256) as 256 }, integ };
     const k = deriveChildKeys(this.suite!.prf!, this.keys!.skD, this.ni, this.nr, espSuite);
+    this.childSpiIn = spiIn;
     const tsr = ps.find((p) => p.type === PAYLOAD.TSr);
     const networks = tsr ? decodeTs(tsr.body) : all;
     this.o.log(`Tunnel agreed: VPN address ${address}, ESP AES-256 ${integ === AUTH_HMAC_SHA2_384_192 ? 'SHA384' : 'SHA256'}, networks ${networks.map((n) => `${n.start}-${n.end}`).join(', ')}`);
@@ -459,6 +559,7 @@ export class IkeSession {
   /** Tell the gateway the IKE SA is gone (INFORMATIONAL with DELETE), without waiting long for its answer. */
   async delete(): Promise<void> {
     if (!this.keys || !this.socket) return this.close();
+    this.goneHandler = null;
     try {
       this.messageId++;
       const msg = this.encrypted(EXCHANGE.INFORMATIONAL, [{ type: PAYLOAD.DELETE, critical: false, body: Buffer.from([PROTOCOL.IKE, 0, 0, 0]) }]);

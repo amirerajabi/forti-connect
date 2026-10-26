@@ -4,6 +4,7 @@
 import { createHash } from 'node:crypto';
 import * as dgram from 'node:dgram';
 import { authValue, decryptSk, deriveChildKeys, deriveIkeKeys, DiffieHellman, encryptSk, icv, INTEG, randomBytes, type IkeKeys, type Suite } from '../../src/core/ikev2/crypto';
+import { Esp } from '../../src/core/ikev2/esp';
 import { authenticatorResponse, decodeEap, EAP_CODE, EAP_TYPE, encodeEap, generateNtResponse, mschapv2Msk } from '../../src/core/ikev2/mschapv2';
 import {
   AUTH_SHARED_KEY,
@@ -47,6 +48,12 @@ export interface FakeGatewayOptions {
 
 export interface FakeGateway {
   port: number;
+  /** Inner packets the gateway received over ESP (it sends each one straight back). */
+  received: Buffer[];
+  /** The gateway's own request: an empty INFORMATIONAL (a liveness check); resolves with the answer's payload types. */
+  probe(): Promise<number[]>;
+  /** The gateway ends the IKE SA. */
+  deleteIke(): Promise<void>;
   /** What the gateway saw and decided, for the test to check. */
   seen: { idi?: string; idType?: number; childSpiIn?: Buffer; childKeys?: ReturnType<typeof deriveChildKeys>; espSuite?: Suite };
   close(): void;
@@ -74,23 +81,56 @@ export async function startFakeGateway(o: FakeGatewayOptions): Promise<FakeGatew
   let peerChallenge: Buffer | null = null;
   let msk: Buffer | null = null;
   let stage = 0;
+  let esp: Esp | null = null;
+  let client: dgram.RemoteInfo | null = null;
+  const received: Buffer[] = [];
+  let ownMessageId = 0;
+  const waiting = new Map<number, (types: number[]) => void>();
 
   // In the tests the "NAT-T" port is the same socket: everything after IKE_SA_INIT carries the zero marker.
   const reply = (data: Buffer, rinfo: dgram.RemoteInfo, marker: boolean) => sock.send(marker ? Buffer.concat([Buffer.alloc(4), data]) : data, rinfo.port, rinfo.address);
 
-  const encrypted = (messageId: number, payloads: Payload[]) => {
+  const encrypted = (messageId: number, payloads: Payload[], exchange: number = EXCHANGE.IKE_AUTH) => {
     const inner = encodePayloads(payloads);
     const body = encryptSk(suite, keys.skEr, inner);
     const icvLen = INTEG[suite.integ].icvLength;
-    const header = encodeHeader({ spiI, spiR, next: PAYLOAD.SK, exchange: EXCHANGE.IKE_AUTH, flags: FLAG.RESPONSE, messageId }, HEADER_LENGTH + 4 + body.length + icvLen);
-    const sk = Buffer.from([payloads[0].type, 0, 0, 0]);
+    const header = encodeHeader({ spiI, spiR, next: PAYLOAD.SK, exchange, flags: FLAG.RESPONSE, messageId }, HEADER_LENGTH + 4 + body.length + icvLen);
+    const sk = Buffer.from([payloads[0]?.type ?? PAYLOAD.NONE, 0, 0, 0]);
     sk.writeUInt16BE(4 + body.length + icvLen, 2);
     const unsigned = Buffer.concat([header, sk, body]);
     return Buffer.concat([unsigned, icv(suite, keys.skAr, unsigned)]);
   };
 
+  /** A request from the gateway (it is the IKE responder, so its messages carry neither I nor R flag). */
+  const own = (exchange: number, payloads: Payload[]) => {
+    const id = ownMessageId++;
+    const inner = encodePayloads(payloads);
+    const body = encryptSk(suite, keys.skEr, inner);
+    const icvLen = INTEG[suite.integ].icvLength;
+    const header = encodeHeader({ spiI, spiR, next: PAYLOAD.SK, exchange, flags: 0, messageId: id }, HEADER_LENGTH + 4 + body.length + icvLen);
+    const sk = Buffer.from([payloads[0]?.type ?? PAYLOAD.NONE, 0, 0, 0]);
+    sk.writeUInt16BE(4 + body.length + icvLen, 2);
+    const unsigned = Buffer.concat([header, sk, body]);
+    return new Promise<number[]>((resolve) => {
+      waiting.set(id, resolve);
+      reply(Buffer.concat([unsigned, icv(suite, keys.skAr, unsigned)]), client!, true);
+    });
+  };
+
   sock.on('message', (raw, rinfo) => {
+    if (raw.length === 1 && raw[0] === 0xff) return;
     const marker = raw.length >= 4 && raw.readUInt32BE(0) === 0;
+    if (!marker && esp && stage === 5) {
+      // ESP from the client: deliver (here: keep) the packet and send it straight back.
+      try {
+        const inner = esp.decapsulate(raw);
+        received.push(inner);
+        sock.send(esp.encapsulate(inner), rinfo.port, rinfo.address);
+      } catch {
+        /* not for us */
+      }
+      return;
+    }
     const msg = marker ? raw.subarray(4) : raw;
     const h = decodeHeader(msg);
     if (h.exchange === EXCHANGE.IKE_SA_INIT) {
@@ -121,10 +161,23 @@ export async function startFakeGateway(o: FakeGatewayOptions): Promise<FakeGatew
       keys = deriveIkeKeys(suite, dh.computeSecret(ke.data), ni, nr, spiI, spiR);
       return reply(initResponse, rinfo, false);
     }
-    if (h.exchange !== EXCHANGE.IKE_AUTH) return;
     const m = msg.subarray(0, h.length);
+    if (h.flags & FLAG.RESPONSE) {
+      // The client's answer to one of the gateway's own requests.
+      const inner = decryptSk(suite, keys.skEi, keys.skAi, m, m.subarray(HEADER_LENGTH + 4, HEADER_LENGTH + m.readUInt16BE(HEADER_LENGTH + 2)));
+      const types = decodePayloads(m[HEADER_LENGTH], inner).map((p) => p.type);
+      waiting.get(h.messageId)?.(types);
+      waiting.delete(h.messageId);
+      return;
+    }
+    if (h.exchange === EXCHANGE.INFORMATIONAL && stage === 5) {
+      // The client's liveness check or DELETE: an empty answer.
+      return reply(encrypted(h.messageId, [], EXCHANGE.INFORMATIONAL), rinfo, true);
+    }
+    if (h.exchange !== EXCHANGE.IKE_AUTH) return;
     const inner = decryptSk(suite, keys.skEi, keys.skAi, m, m.subarray(HEADER_LENGTH + 4, HEADER_LENGTH + m.readUInt16BE(HEADER_LENGTH + 2)));
     const ps = decodePayloads(m[HEADER_LENGTH], inner);
+    client = rinfo;
     const send = (payloads: Payload[]) => reply(encrypted(h.messageId, payloads), rinfo, true);
     if (stage === 0) {
       const idi = ps.find((p) => p.type === PAYLOAD.IDi)!;
@@ -183,7 +236,9 @@ export async function startFakeGateway(o: FakeGatewayOptions): Promise<FakeGatew
       seen.childSpiIn = spiOurs;
       seen.childKeys = deriveChildKeys(suite.prf!, keys.skD, ni, nr, espSuite);
       stage = 5;
-      void espProposalSpi;
+      // The gateway's side of the ESP SA: what the client sends out comes in here, and the other way round.
+      const ck = seen.childKeys;
+      esp = new Esp({ spiOut: espProposalSpi, spiIn: spiOurs, suite: espSuite, encrOut: ck.encrIn, integOut: ck.integIn, encrIn: ck.encrOut, integIn: ck.integOut });
       return send([
         { type: PAYLOAD.AUTH, critical: false, body: encodeAuth(AUTH_SHARED_KEY, authValue(suite.prf!, msk!, initResponse, ni, keys.skPr, idrBody)) },
         { type: PAYLOAD.CP, critical: false, body: encodeCp(CFG_REPLY, [{ type: CP_ATTR.INTERNAL_IP4_ADDRESS, value: ip4('10.212.134.5') }, { type: CP_ATTR.INTERNAL_IP4_DNS, value: ip4('10.0.0.53') }]) },
@@ -193,5 +248,12 @@ export async function startFakeGateway(o: FakeGatewayOptions): Promise<FakeGatew
       ]);
     }
   });
-  return { port, seen, close: () => sock.close() };
+  return {
+    port,
+    seen,
+    received,
+    probe: () => own(EXCHANGE.INFORMATIONAL, []),
+    deleteIke: () => own(EXCHANGE.INFORMATIONAL, [{ type: PAYLOAD.DELETE, critical: false, body: Buffer.from([PROTOCOL.IKE, 0, 0, 0]) }]).then(() => undefined),
+    close: () => sock.close(),
+  };
 }

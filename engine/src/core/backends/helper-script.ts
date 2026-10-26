@@ -13,11 +13,15 @@
 // Written in C# compiled by PowerShell at start (Add-Type): both ship with every Windows 10 / 11, nothing to install.
 // Lines on the pipe are JSON. Client → helper: {op:'hello'} | {op:'start', ...} | {op:'stdin', d} | {op:'stop'}.
 // Helper → client: {t:'hello', version} | {t:'out'|'err', d} | {t:'exit', code} | {t:'error', message}.
+// For FortiConnect's own IPsec engine: {op:'tun', address, netmask, dns, gateway, split, mtu} makes the helper open the
+// Wintun adapter and set it up with OpenConnect's vpnc-script; it answers {t:'tun-ready', index}, and from then on both
+// sides send IP packets as frames (two bytes of length, big-endian, then the packet) until the client closes the pipe.
+// The client sends no frame before tun-ready, so nothing binary is ever read as a line.
 
 import { gzipSync } from 'node:zlib';
 
 /** Bump when the helper changes: an older one installed on a computer is offered as an update. */
-export const HELPER_VERSION = 3;
+export const HELPER_VERSION = 4;
 export const HELPER_PIPE = '\\\\.\\pipe\\forticonnect-helper';
 export const HELPER_TASK = 'FortiConnect VPN helper';
 export const HELPER_DIR_NAME = 'FortiConnect Helper';
@@ -45,6 +49,7 @@ public static class FcHelper {
   static List<SecurityIdentifier> allowed = new List<SecurityIdentifier>();
   static readonly object busy = new object();
   static Process current;
+  static bool tunActive;
 
   public static void Run(string pipe, string users, string test, string work, string helperHome) {
     home = helperHome;
@@ -111,6 +116,17 @@ public static class FcHelper {
         try { Pipe.Write(bytes, 0, bytes.Length); Pipe.Flush(); } catch { }
       }
     }
+    /** One IP packet as a frame: two bytes of length, then the packet. */
+    public bool Frame(byte[] packet, int length) {
+      lock (gate) {
+        try {
+          Pipe.Write(new byte[] { (byte)(length >> 8), (byte)length }, 0, 2);
+          Pipe.Write(packet, 0, length);
+          Pipe.Flush();
+          return true;
+        } catch { return false; }
+      }
+    }
     public void Send(string t, string key, object value) {
       Dictionary<string, object> m = new Dictionary<string, object>();
       m["t"] = t;
@@ -143,6 +159,15 @@ public static class FcHelper {
             conn.Send("error", "message", e.Message);
             break;
           }
+        } else if (op == "tun") {
+          if (mine != null) { conn.Send("error", "message", "Already started"); continue; }
+          try {
+            RunTun(msg, conn, pipe);
+          } catch (Exception e) {
+            Log("tun: " + e.Message);
+            conn.Send("error", "message", e.Message);
+          }
+          break;
         } else if (op == "stdin") {
           string d = Str(msg, "d");
           if (mine != null && d != null && d.Length < 10000) {
@@ -198,6 +223,171 @@ public static class FcHelper {
       Log(interrupted ? "did not end after Ctrl+C, killing it" : "could not send Ctrl+C, killing it");
       try { if (!p.HasExited) p.Kill(); } catch { }
       try { p.WaitForExit(5000); } catch { }
+    }
+  }
+
+  // ---------------------------------------------------------------- the adapter for FortiConnect's own IPsec engine
+
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr LoadLibraryW(string path);
+  [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint ms);
+  [DllImport("iphlpapi.dll")] static extern int ConvertInterfaceLuidToIndex(ref ulong luid, out uint index);
+  [DllImport("wintun.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr WintunCreateAdapter(string name, string tunnelType, IntPtr guid);
+  [DllImport("wintun.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr WintunOpenAdapter(string name);
+  [DllImport("wintun.dll")] static extern void WintunCloseAdapter(IntPtr adapter);
+  [DllImport("wintun.dll")] static extern void WintunGetAdapterLUID(IntPtr adapter, out ulong luid);
+  [DllImport("wintun.dll", SetLastError = true)] static extern IntPtr WintunStartSession(IntPtr adapter, uint capacity);
+  [DllImport("wintun.dll")] static extern void WintunEndSession(IntPtr session);
+  [DllImport("wintun.dll")] static extern IntPtr WintunGetReadWaitEvent(IntPtr session);
+  [DllImport("wintun.dll", SetLastError = true)] static extern IntPtr WintunReceivePacket(IntPtr session, out uint size);
+  [DllImport("wintun.dll")] static extern void WintunReleaseReceivePacket(IntPtr session, IntPtr packet);
+  [DllImport("wintun.dll", SetLastError = true)] static extern IntPtr WintunAllocateSendPacket(IntPtr session, uint size);
+  [DllImport("wintun.dll")] static extern void WintunSendPacket(IntPtr session, IntPtr packet);
+
+  const string IPV4 = @"^(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$";
+
+  static string MaskOf(int len) {
+    uint m = len == 0 ? 0 : 0xffffffffu << (32 - len);
+    return (m >> 24) + "." + ((m >> 16) & 255) + "." + ((m >> 8) & 255) + "." + (m & 255);
+  }
+
+  static bool ReadFull(Stream s, byte[] buf, int len) {
+    int got = 0;
+    while (got < len) {
+      int n = s.Read(buf, got, len - got);
+      if (n <= 0) return false;
+      got += n;
+    }
+    return true;
+  }
+
+  /** vpnc-script-win.js, the one OpenConnect ships next to itself, with the environment OpenConnect gives it. */
+  static void RunScript(string reason, Dictionary<string, string> env, string dir) {
+    string script = Path.Combine(dir, "vpnc-script-win.js");
+    ProcessStartInfo psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cscript.exe"), "//nologo \\"" + script + "\\"");
+    psi.UseShellExecute = false;
+    psi.CreateNoWindow = true;
+    psi.RedirectStandardOutput = true;
+    psi.RedirectStandardError = true;
+    psi.WorkingDirectory = dir;
+    foreach (KeyValuePair<string, string> kv in env) psi.EnvironmentVariables[kv.Key] = kv.Value;
+    psi.EnvironmentVariables["reason"] = reason;
+    using (Process p = Process.Start(psi)) {
+      string output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+      if (!p.WaitForExit(60000)) { try { p.Kill(); } catch { } }
+      Log("vpnc-script " + reason + ": " + output.Replace("\\r\\n", " | "));
+    }
+  }
+
+  /**
+   * Open the FortiConnect adapter, give it the address, routes and DNS the gateway handed out, and carry packets between
+   * it and the client until the client closes the pipe; then undo the setup. Every field is checked: nothing from the
+   * client reaches a command line unchecked.
+   */
+  static void RunTun(Dictionary<string, object> m, Conn conn, Stream pipe) {
+    string address = Need(Str(m, "address"), IPV4, "address");
+    string netmask = Str(m, "netmask");
+    if (string.IsNullOrEmpty(netmask)) netmask = "255.255.255.255";
+    Need(netmask, IPV4, "netmask");
+    string gateway = Need(Str(m, "gateway"), IPV4, "gateway");
+    List<string> dns = new List<string>();
+    foreach (string d in (Str(m, "dns") ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)) dns.Add(Need(d, IPV4, "DNS server"));
+    if (dns.Count > 4) throw new Exception("Too many DNS servers");
+    List<string[]> split = new List<string[]>();
+    foreach (string net in (Str(m, "split") ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)) {
+      string[] parts = net.Split('/');
+      if (parts.Length != 2) throw new Exception("Invalid network");
+      Need(parts[0], IPV4, "network");
+      int len = int.Parse(Need(parts[1], @"^[0-9]{1,2}$", "prefix length"));
+      if (len > 32) throw new Exception("Invalid prefix length");
+      split.Add(new[] { parts[0], MaskOf(len), len.ToString() });
+    }
+    if (split.Count > 100) throw new Exception("Too many networks");
+    int mtu = int.Parse(Need(Str(m, "mtu") ?? "1400", @"^[0-9]{3,4}$", "MTU"));
+    if (mtu < 576 || mtu > 1500) throw new Exception("Invalid MTU");
+    // Test mode: no adapter and no setup, packets come straight back.
+    bool echo = testCommand == "tun-echo";
+
+    lock (busy) {
+      if (tunActive || (current != null && !current.HasExited)) throw new Exception("Another FortiConnect connection is already running through the helper");
+      tunActive = true;
+    }
+    string dir = Path.Combine(home ?? "", "openconnect");
+    IntPtr adapter = IntPtr.Zero;
+    IntPtr session = IntPtr.Zero;
+    Dictionary<string, string> env = null;
+    bool stop = false;
+    Thread fromAdapter = null;
+    try {
+      uint index = 0;
+      if (!echo) {
+        if (LoadLibraryW(Path.Combine(dir, "wintun.dll")) == IntPtr.Zero) throw new Exception("wintun.dll could not be loaded from " + dir);
+        adapter = WintunOpenAdapter("FortiConnect");
+        if (adapter == IntPtr.Zero) adapter = WintunCreateAdapter("FortiConnect", "FortiConnect", IntPtr.Zero);
+        if (adapter == IntPtr.Zero) throw new Exception("Could not create the VPN adapter (error " + Marshal.GetLastWin32Error() + ")");
+        ulong luid;
+        WintunGetAdapterLUID(adapter, out luid);
+        ConvertInterfaceLuidToIndex(ref luid, out index);
+        session = WintunStartSession(adapter, 0x400000);
+        if (session == IntPtr.Zero) throw new Exception("Could not start the VPN adapter (error " + Marshal.GetLastWin32Error() + ")");
+        env = new Dictionary<string, string>();
+        env["TUNDEV"] = "FortiConnect";
+        env["TUNIDX"] = index.ToString();
+        env["VPNGATEWAY"] = gateway;
+        env["INTERNAL_IP4_ADDRESS"] = address;
+        env["INTERNAL_IP4_NETMASK"] = netmask;
+        env["INTERNAL_IP4_MTU"] = mtu.ToString();
+        if (dns.Count > 0) env["INTERNAL_IP4_DNS"] = string.Join(" ", dns.ToArray());
+        if (split.Count > 0) {
+          env["CISCO_SPLIT_INC"] = split.Count.ToString();
+          for (int i = 0; i < split.Count; i++) {
+            env["CISCO_SPLIT_INC_" + i + "_ADDR"] = split[i][0];
+            env["CISCO_SPLIT_INC_" + i + "_MASK"] = split[i][1];
+            env["CISCO_SPLIT_INC_" + i + "_MASKLEN"] = split[i][2];
+          }
+        }
+        RunScript("connect", env, dir);
+        IntPtr readEvent = WintunGetReadWaitEvent(session);
+        IntPtr sess = session;
+        fromAdapter = new Thread(() => {
+          while (!stop) {
+            uint size;
+            IntPtr p = WintunReceivePacket(sess, out size);
+            if (p == IntPtr.Zero) {
+              int err = Marshal.GetLastWin32Error();
+              if (err == 259) { WaitForSingleObject(readEvent, 250); continue; }
+              Log("adapter read ended (" + err + ")");
+              break;
+            }
+            byte[] b = new byte[size];
+            Marshal.Copy(p, b, 0, (int)size);
+            WintunReleaseReceivePacket(sess, p);
+            if (!conn.Frame(b, (int)size)) break;
+          }
+        });
+        fromAdapter.IsBackground = true;
+        fromAdapter.Start();
+      }
+      Log("tun up: " + address + (split.Count > 0 ? " (" + split.Count + " networks)" : " (all traffic)"));
+      conn.Send("tun-ready", "index", (int)index);
+      byte[] head = new byte[2];
+      byte[] packet = new byte[65535];
+      while (ReadFull(pipe, head, 2)) {
+        int len = (head[0] << 8) | head[1];
+        if (len == 0 || !ReadFull(pipe, packet, len)) break;
+        if (echo) { if (!conn.Frame(packet, len)) break; continue; }
+        IntPtr p = WintunAllocateSendPacket(session, (uint)len);
+        if (p == IntPtr.Zero) continue;
+        Marshal.Copy(packet, 0, p, len);
+        WintunSendPacket(session, p);
+      }
+    } finally {
+      stop = true;
+      if (fromAdapter != null) fromAdapter.Join(2000);
+      if (env != null) { try { RunScript("disconnect", env, dir); } catch (Exception e) { Log("vpnc-script disconnect: " + e.Message); } }
+      if (session != IntPtr.Zero) WintunEndSession(session);
+      if (adapter != IntPtr.Zero) WintunCloseAdapter(adapter);
+      lock (busy) { tunActive = false; }
+      Log("tun down");
     }
   }
 
@@ -275,7 +465,7 @@ public static class FcHelper {
     args.Add("https://" + host + ":" + port + (realm != "" ? "/" + realm : ""));
 
     lock (busy) {
-      if (current != null && !current.HasExited) throw new Exception("Another FortiConnect connection is already running through the helper");
+      if (tunActive || (current != null && !current.HasExited)) throw new Exception("Another FortiConnect connection is already running through the helper");
       ProcessStartInfo psi = new ProcessStartInfo(exe);
       List<string> quoted = new List<string>();
       foreach (string a in args) quoted.Add(Quote(a));
@@ -337,6 +527,20 @@ public static class FcHelper {
 }
 `;
 
+/**
+ * The C# as it is installed: without comment lines and indentation. The install script carries it inside a command
+ * line, which Windows caps at 32767 characters; the comments stay here in the source. Only whole comment lines go, so
+ * nothing inside a string (like "//nologo") is touched.
+ */
+function compact(source: string): string {
+  return source
+    .replace(/^\s*\/\*\*[\s\S]*?\*\/\s*$/gm, '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('//'))
+    .join('\n');
+}
+
 /** The helper itself: fc-helper.ps1. users.txt beside it lists the Windows accounts (SIDs) allowed to use it. */
 export const HELPER_PS1 = `param([string]$PipeName = 'forticonnect-helper', [string]$TestCommand = '', [string]$WorkDir = '')
 $ErrorActionPreference = 'Stop'
@@ -345,7 +549,7 @@ $usersFile = Join-Path $PSScriptRoot 'users.txt'
 $users = ''
 if (Test-Path $usersFile) { $users = Get-Content $usersFile -Raw }
 Add-Type -ReferencedAssemblies System.Core, System.Web.Extensions -TypeDefinition @'
-${CSHARP}
+${compact(CSHARP)}
 '@
 [FcHelper]::Run($PipeName, $users, $TestCommand, $WorkDir, $PSScriptRoot)
 `;

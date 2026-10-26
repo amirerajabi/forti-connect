@@ -30,7 +30,9 @@ import { authenticatorResponse, desEncryptBlock, generateNtResponse, masterKey, 
 import { PRF_HMAC_SHA2_384 } from '../src/core/ikev2/payloads';
 import { IkeSession } from '../src/core/ikev2/session';
 import { startFakeGateway } from './fixtures/fake-ikev2-gateway';
-import { Ikev2Tunnel } from '../src/core/backends/ikev2';
+import { Ikev2Tunnel, rangesToNetworks } from '../src/core/backends/ikev2';
+import { Esp } from '../src/core/ikev2/esp';
+import { helperTun, type HelperTun, type TunSetup } from '../src/core/backends/helper';
 
 const FIXTURES = path.join(import.meta.dirname, 'fixtures');
 const FAKE_VPN = path.join(FIXTURES, 'fake-vpn.mjs');
@@ -796,24 +798,147 @@ describe('IKEv2 engine', () => {
   });
 });
 
-test('Windows IKEv2 profiles log in with the built-in engine and report it (traffic is the next step)', async () => {
-  const g = await startFakeGateway({ psk: 'shared', userName: 'azure1', password: 'pw' });
-  const m = new Manager(tmpDir(), {
-    platform: 'win32',
-    elevated: false,
-    backends: { ssl: { available: false, kind: 'openconnect', path: null, version: null }, ipsec: { available: true, kind: 'ras', path: null, version: null, modes: ['ikev2', 'l2tp'] }, elevated: false, platform: 'win32' },
-    secretKey: KEY,
-    tunnelFactory: (ctx) => new Ikev2Tunnel({ profile: ctx.profile, secrets: ctx.secrets, hooks: ctx.hooks, session: { port: g.port, natPort: g.port } }),
+describe('IPsec traffic (ESP)', () => {
+  const suite = { encr: { id: 12 as const, keyLength: 256 as const }, integ: 12 };
+  const k = { a: Buffer.alloc(32, 1), b: Buffer.alloc(32, 2), c: Buffer.alloc(32, 3), d: Buffer.alloc(32, 4) };
+  const pair = () => {
+    const spiA = Buffer.from([0, 0, 0, 1]);
+    const spiB = Buffer.from([0, 0, 0, 2]);
+    return {
+      me: new Esp({ spiOut: spiB, spiIn: spiA, suite, encrOut: k.a, integOut: k.b, encrIn: k.c, integIn: k.d }),
+      gw: new Esp({ spiOut: spiA, spiIn: spiB, suite, encrOut: k.c, integOut: k.d, encrIn: k.a, integIn: k.b }),
+    };
+  };
+  const ipv4 = (len: number) => {
+    const p = Buffer.alloc(len, 7);
+    p[0] = 0x45;
+    return p;
+  };
+
+  test('packets of every size round-trip; replays and tampering are dropped', () => {
+    const { me, gw } = pair();
+    for (const len of [20, 21, 33, 100, 1399, 1400]) assert.ok(gw.decapsulate(me.encapsulate(ipv4(len))).equals(ipv4(len)), `length ${len}`);
+    const p = me.encapsulate(ipv4(60));
+    assert.ok(gw.decapsulate(p).length === 60);
+    assert.throws(() => gw.decapsulate(p), /Replayed/);
+    const t = Buffer.from(me.encapsulate(ipv4(60)));
+    t[30] ^= 1;
+    assert.throws(() => gw.decapsulate(t), /integrity/);
+    // Out of order within the window is fine.
+    const a = me.encapsulate(ipv4(40));
+    const b = me.encapsulate(ipv4(40));
+    assert.equal(gw.decapsulate(b).length, 40);
+    assert.equal(gw.decapsulate(a).length, 40);
   });
-  await m.load();
-  try {
-    const p = m.addProfile({ name: 'PDN', type: 'ipsec', gateway: '127.0.0.1', port: 443, username: 'azure1', ike: 'ikev2', localId: 'dialup1', savePassword: true, password: 'pw', psk: 'shared' });
-    assert.equal(m.getProfile(p.id)!.localId, 'dialup1');
-    await assert.rejects(m.connect(p.id), /the login worked \(VPN address 10\.212\.134\.5\)/);
-    assert.equal(g.seen.idi, 'dialup1');
-    assert.ok(m.state().logs.some((l) => /Logged in to the FortiGate with IPsec/.test(l.text)));
-  } finally {
-    g.close();
-    await m.shutdown();
-  }
+
+  test('traffic selectors become networks; everything means all traffic', () => {
+    assert.deepEqual(rangesToNetworks([{ start: '0.0.0.0', end: '255.255.255.255' }]), []);
+    assert.deepEqual(rangesToNetworks([{ start: '10.0.0.0', end: '10.255.255.255' }, { start: '192.168.4.0', end: '192.168.4.255' }]), ['10.0.0.0/8', '192.168.4.0/24']);
+    assert.deepEqual(rangesToNetworks([{ start: '10.0.0.1', end: '10.0.0.6' }]), ['10.0.0.1/32', '10.0.0.2/31', '10.0.0.4/31', '10.0.0.6/32']);
+  });
+
+  /** A stand-in for the helper's adapter: packets "from the computer" are injected, packets "to it" collected. */
+  const fakeTun = () => {
+    let fromComputer: (p: Buffer) => void = () => undefined;
+    const closers: ((r: string | null) => void)[] = [];
+    const delivered: Buffer[] = [];
+    const tun: HelperTun = { ready: Promise.resolve(), onPacket: (cb) => (fromComputer = cb), onClosed: (cb) => void closers.push(cb), send: (p) => void delivered.push(p), close: () => undefined };
+    let setup: TunSetup | null = null;
+    return {
+      make: (s: TunSetup) => {
+        setup = s;
+        return tun;
+      },
+      inject: (p: Buffer) => fromComputer(p),
+      delivered,
+      setup: () => setup,
+    };
+  };
+  const until = async (cond: () => boolean, ms = 5000) => {
+    const end = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > end) throw new Error('timed out');
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  test('a Windows IKEv2 profile connects, carries packets both ways, answers the gateway, and drops when it ends', async () => {
+    const g = await startFakeGateway({ psk: 'shared', userName: 'azure1', password: 'pw' });
+    const t = fakeTun();
+    const m = new Manager(tmpDir(), {
+      platform: 'win32',
+      elevated: false,
+      backends: { ssl: { available: false, kind: 'openconnect', path: null, version: null }, ipsec: { available: true, kind: 'ras', path: null, version: null, modes: ['ikev2', 'l2tp'] }, elevated: false, platform: 'win32' },
+      secretKey: KEY,
+      tunnelFactory: (ctx) => new Ikev2Tunnel({ profile: ctx.profile, secrets: ctx.secrets, hooks: ctx.hooks, session: { port: g.port, natPort: g.port }, tun: t.make }),
+    });
+    await m.load();
+    await m.updateSettings({ reconnect: false });
+    try {
+      const p = m.addProfile({ name: 'PDN', type: 'ipsec', gateway: '127.0.0.1', port: 443, username: 'azure1', ike: 'ikev2', localId: 'dialup1', savePassword: true, password: 'pw', psk: 'shared' });
+      const c = await m.connect(p.id);
+      assert.equal(c.status, 'connected');
+      assert.equal(c.address, '10.212.134.5');
+      assert.equal(c.device, 'FortiConnect');
+      assert.deepEqual(t.setup(), { address: '10.212.134.5', netmask: null, dns: ['10.0.0.53'], gateway: '127.0.0.1', split: ['10.0.0.0/8'], mtu: 1400 });
+      // A packet from the computer reaches the gateway, and the gateway's answer reaches the computer.
+      const packet = Buffer.alloc(84, 9);
+      packet[0] = 0x45;
+      t.inject(packet);
+      await until(() => t.delivered.length === 1);
+      assert.ok(g.received[0].equals(packet));
+      assert.ok(t.delivered[0].equals(packet));
+      // IPv6 from Windows is not sent.
+      const v6 = Buffer.alloc(60);
+      v6[0] = 0x60;
+      t.inject(v6);
+      await new Promise((r) => setTimeout(r, 200));
+      assert.equal(g.received.length, 1);
+      // The gateway's liveness check is answered.
+      assert.deepEqual(await g.probe(), []);
+      assert.equal(m.state().connection.status, 'connected');
+      // The gateway ends the tunnel: FortiConnect notices and says why.
+      await g.deleteIke();
+      await until(() => m.state().connection.status === 'disconnected');
+      assert.match(m.state().connection.error ?? '', /FortiGate ended the IPsec tunnel/);
+    } finally {
+      g.close();
+      await m.shutdown();
+    }
+  });
+});
+
+// The helper's adapter mode, for real: the script compiled by PowerShell in test mode, where packets come straight back.
+describe('Windows VPN helper: the adapter for IPsec', { skip: process.platform !== 'win32' }, () => {
+  const pipeName = `forticonnect-tun-test-${process.pid}`;
+  const pipe = `\\\\.\\pipe\\${pipeName}`;
+  let helper: ChildProcess;
+  const dir = tmpDir();
+  before(async () => {
+    fs.writeFileSync(path.join(dir, 'fc-helper.ps1'), HELPER_PS1);
+    helper = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(dir, 'fc-helper.ps1'), '-PipeName', pipeName, '-TestCommand', 'tun-echo', '-WorkDir', path.join(dir, 'work')], { windowsHide: true });
+    const end = Date.now() + 90_000;
+    while (Date.now() < end) {
+      if ((await helloHelper(pipe, 1000)) === HELPER_VERSION) return;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error('The helper did not start');
+  });
+  after(() => helper?.kill());
+
+  test('checks the setup, then carries framed packets both ways', async () => {
+    const bad = helperTun({ address: '10.0.0.1; calc', netmask: null, dns: [], gateway: '1.2.3.4', split: [], mtu: 1400 }, pipe);
+    await assert.rejects(bad.ready, /Invalid address/);
+    const tun = helperTun({ address: '192.168.4.11', netmask: null, dns: ['217.218.127.127'], gateway: '178.252.144.146', split: ['10.0.0.0/8'], mtu: 1400 }, pipe);
+    await tun.ready;
+    const got: Buffer[] = [];
+    tun.onPacket((p) => got.push(p));
+    const packets = [Buffer.alloc(20, 1), Buffer.alloc(1400, 2), Buffer.alloc(77, 3)];
+    for (const p of packets) tun.send(p);
+    const end = Date.now() + 5000;
+    while (got.length < packets.length && Date.now() < end) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(got.length, 3);
+    packets.forEach((p, i) => assert.ok(got[i].equals(p)));
+    tun.close();
+  });
 });

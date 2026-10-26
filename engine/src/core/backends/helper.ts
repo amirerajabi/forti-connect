@@ -218,3 +218,112 @@ export function helperProcess(start: HelperStart, pipe = HELPER_PIPE): VpnProces
     },
   };
 }
+
+/** What the helper needs to set up the adapter for FortiConnect's own IPsec engine. */
+export interface TunSetup {
+  address: string;
+  netmask: string | null;
+  dns: string[];
+  /** The gateway's public address: the helper keeps a route to it outside the tunnel. */
+  gateway: string;
+  /** Networks through the tunnel as "a.b.c.d/len"; empty sends everything. */
+  split: string[];
+  mtu: number;
+}
+
+export interface HelperTun {
+  /** The adapter is up: packets can flow. */
+  ready: Promise<void>;
+  onPacket(cb: (packet: Buffer) => void): void;
+  /** The pipe closed (the helper ended, or close() was called), with why when it was not asked to. */
+  onClosed(cb: (reason: string | null) => void): void;
+  send(packet: Buffer): void;
+  close(): void;
+}
+
+/**
+ * The FortiConnect adapter, opened by the helper: IP packets from this computer arrive through onPacket, and send()
+ * hands packets from the gateway to Windows. Closing it (or the engine ending) makes the helper undo the setup.
+ */
+export function helperTun(setup: TunSetup, pipe = HELPER_PIPE): HelperTun {
+  const packets: ((p: Buffer) => void)[] = [];
+  const closers: ((reason: string | null) => void)[] = [];
+  let socket: net.Socket | null = null;
+  let binary = false;
+  let closing = false;
+  let failure: string | null = null;
+  let buf = Buffer.alloc(0);
+  let resolveReady!: () => void;
+  let rejectReady!: (e: Error) => void;
+  const ready = new Promise<void>((res, rej) => {
+    resolveReady = res;
+    rejectReady = rej;
+  });
+  ready.catch(() => undefined);
+  const finish = () => {
+    for (const c of closers) c(closing ? null : (failure ?? 'The VPN helper closed the adapter'));
+  };
+  openPipe(pipe).then(
+    (s) => {
+      socket = s;
+      if (closing) return void s.destroy();
+      s.on('data', (d: Buffer) => {
+        buf = buf.length ? Buffer.concat([buf, d]) : d;
+        if (!binary) {
+          const nl = buf.indexOf(0x0a);
+          if (nl < 0) return;
+          const line = buf.subarray(0, nl).toString('utf8');
+          buf = buf.subarray(nl + 1);
+          try {
+            const m = JSON.parse(line) as { t?: string; message?: string };
+            if (m.t === 'tun-ready') {
+              binary = true;
+              resolveReady();
+            } else if (m.t === 'error') {
+              failure = `VPN helper: ${m.message ?? 'refused'}`;
+              rejectReady(new Error(failure));
+              s.destroy();
+              return;
+            }
+          } catch {
+            return;
+          }
+        }
+        // Frames: two bytes of length, then the packet.
+        while (binary && buf.length >= 2) {
+          const len = buf.readUInt16BE(0);
+          if (buf.length < 2 + len) break;
+          const packet = Buffer.from(buf.subarray(2, 2 + len));
+          buf = buf.subarray(2 + len);
+          for (const cb of packets) cb(packet);
+        }
+      });
+      s.on('error', () => undefined);
+      s.on('close', () => {
+        if (!binary) rejectReady(new Error(failure ?? 'The VPN helper closed the connection'));
+        finish();
+      });
+      s.write(`${JSON.stringify({ op: 'tun', address: setup.address, netmask: setup.netmask ?? '', dns: setup.dns.join(' '), gateway: setup.gateway, split: setup.split.join(' '), mtu: setup.mtu })}\n`);
+    },
+    (e: NodeJS.ErrnoException) => {
+      failure = e.code === 'ENOENT' ? 'The FortiConnect VPN helper is not running' : errorMessage(e);
+      rejectReady(new Error(failure));
+      finish();
+    },
+  );
+  return {
+    ready,
+    onPacket: (cb) => void packets.push(cb),
+    onClosed: (cb) => void closers.push(cb),
+    send: (packet) => {
+      if (!socket || !binary || socket.destroyed || packet.length > 65535) return;
+      const head = Buffer.alloc(2);
+      head.writeUInt16BE(packet.length);
+      socket.write(Buffer.concat([head, packet]));
+    },
+    close: () => {
+      closing = true;
+      socket?.end();
+    },
+  };
+}

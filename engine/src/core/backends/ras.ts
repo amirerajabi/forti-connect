@@ -8,7 +8,7 @@ import { powershell, run, sys32 } from '../system';
 import type { Leftover, PromptRequest, Tunnel, TunnelHooks, TunnelUp } from './types';
 
 export function detectRas(): BackendInfo {
-  return { available: true, kind: 'ras', path: null, version: null, modes: ['ikev2', 'l2tp'], note: "IKEv2 with FortiConnect's own engine (login only so far); L2TP/IPsec with Windows' own VPN client. No IKEv1 + XAuth." };
+  return { available: true, kind: 'ras', path: null, version: null, modes: ['ikev2', 'l2tp'], note: "IKEv2 with FortiConnect's own engine (through the VPN helper); L2TP/IPsec with Windows' own VPN client. No IKEv1 + XAuth." };
 }
 
 /** The phonebook entry's name: recognisable in Windows' VPN settings, and only characters rasdial takes. */
