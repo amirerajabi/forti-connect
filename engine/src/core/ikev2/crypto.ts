@@ -90,14 +90,35 @@ export function deriveIkeKeys(suite: Suite, sharedSecret: Buffer, ni: Buffer, nr
   return { skD: take(prfLen), skAi: take(integLen), skAr: take(integLen), skEi: take(encrLen), skEr: take(encrLen), skPi: take(prfLen), skPr: take(prfLen) };
 }
 
-/** Keys of a child (ESP) SA: KEYMAT = prf+(SK_d, Ni | Nr), initiator-to-responder first (§2.17). */
-export function deriveChildKeys(prfAlg: number, skD: Buffer, ni: Buffer, nr: Buffer, esp: Suite) {
+/**
+ * Keys of a child (ESP) SA: KEYMAT = prf+(SK_d, [g^ir |] Ni | Nr), the exchange initiator's direction first (§2.17).
+ * `secret` is the new Diffie-Hellman secret when a rekey uses PFS. The names say "Out" for the exchange initiator's
+ * sending direction; a responder swaps them.
+ */
+export function deriveChildKeys(prfAlg: number, skD: Buffer, ni: Buffer, nr: Buffer, esp: Suite, secret?: Buffer) {
   const encrLen = esp.encr.keyLength / 8;
   const integLen = INTEG[esp.integ].keyLength;
-  const km = prfPlus(prfAlg, skD, Buffer.concat([ni, nr]), 2 * (encrLen + integLen));
+  const km = prfPlus(prfAlg, skD, Buffer.concat([secret ?? Buffer.alloc(0), ni, nr]), 2 * (encrLen + integLen));
   let off = 0;
   const take = (n: number) => Buffer.from(km.subarray(off, (off += n)));
   return { encrOut: take(encrLen), integOut: take(integLen), encrIn: take(encrLen), integIn: take(integLen) };
+}
+
+/**
+ * The keys of an IKE SA made by rekeying (§2.18): SKEYSEED = prf(SK_d (old), g^ir (new) | Ni | Nr), with the old IKE SA's
+ * PRF (as strongSwan does), then the seven keys with the new SA's PRF, seeded with the new SPIs. Ni and the initiator
+ * SPI are the rekey exchange initiator's.
+ */
+export function deriveRekeyedIkeKeys(suite: Suite, oldPrf: number, oldSkD: Buffer, secret: Buffer, ni: Buffer, nr: Buffer, spiI: Buffer, spiR: Buffer): IkeKeys {
+  const p = suite.prf!;
+  const skeyseed = prf(oldPrf, oldSkD, Buffer.concat([secret, ni, nr]));
+  const prfLen = PRF[p].length;
+  const integLen = INTEG[suite.integ].keyLength;
+  const encrLen = suite.encr.keyLength / 8;
+  const km = prfPlus(p, skeyseed, Buffer.concat([ni, nr, spiI, spiR]), prfLen * 3 + integLen * 2 + encrLen * 2);
+  let off = 0;
+  const take = (n: number) => km.subarray(off, (off += n));
+  return { skD: take(prfLen), skAi: take(integLen), skAr: take(integLen), skEi: take(encrLen), skEr: take(encrLen), skPi: take(prfLen), skPr: take(prfLen) };
 }
 
 function cipherName(keyLength: number): 'aes-128-cbc' | 'aes-192-cbc' | 'aes-256-cbc' {

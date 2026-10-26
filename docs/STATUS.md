@@ -1,9 +1,27 @@
 # Status
 
-Released: 0.5.2 (tag v0.5.2, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.5.1, 0.5.0, 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
+Released: 0.5.3 (tag v0.5.3, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.5.2, 0.5.1, 0.5.0, 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
 0.1.0 (the first release), all on 2026-10-25. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.5.3: IPsec keys renewed during a connection (step 3)
+
+The IKEv2 engine no longer refuses CREATE_CHILD_SA, so a long IPsec connection should no longer drop after ~12 h.
+
+- `ikev2/session.ts` keeps each IKE SA's own state (SPIs, keys, message IDs, and whether FortiConnect is its
+  initiator, which flips when the gateway rekeys the IKE SA) and a list of ESP SAs.
+- It answers the FortiGate's rekeys: new ESP keys (with PFS when the gateway sends a KE) and new IKE keys (RFC 7296
+  §1.3.2, §1.3.3, §2.18). DELETEs of the replaced SAs no longer end the tunnel.
+- It renews the keys itself shortly before the lifetimes end: the phase 2 lifetime is 43200 s, renewed with PFS on the
+  IKE group, and asked again with the group the gateway names (INVALID_KE) or without PFS. The phase 1 lifetime is
+  86400 s. The margin is 10 % of the lifetime (at most 10 min), randomly up to 1.5× so both ends do not start together.
+  FortiConnect then deletes the old SA.
+- `Ikev2Tunnel` accepts packets on every live ESP SA (by SPI) and sends with the newest.
+- Tests: the fake gateway renews the ESP keys (with and without PFS) and the IKE keys, and answers FortiConnect's own
+  renewals (with short lifetimes, asking for another PFS group). Packets go both ways after each renewal.
+- **Not checked against the real FortiGate**, only the fake gateway: a renewal happens after ~12 h. Watch the log of a
+  long connection for "renewed the IPsec keys".
 
 ## In 0.5.2: helper v8 (connect no longer hangs at "Setting up the VPN adapter")
 

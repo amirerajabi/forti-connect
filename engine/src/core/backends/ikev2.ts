@@ -5,7 +5,7 @@
 import type { LogLine, ProfileConfig } from '../../../../shared/protocol';
 import { Esp } from '../ikev2/esp';
 import type { TrafficSelector } from '../ikev2/payloads';
-import { IkeSession } from '../ikev2/session';
+import { IkeSession, type KeepAliveTimers } from '../ikev2/session';
 import type { ProfileSecrets } from '../secrets';
 import { errorMessage } from '../util';
 import { helperTun, type HelperTun, type TunSetup } from './helper';
@@ -56,6 +56,9 @@ export interface Ikev2Options {
   helperPipe?: string;
   /** Tests use their own adapter instead of the helper's. */
   tun?: (setup: TunSetup) => HelperTun;
+  /** Tests: short lifetimes (seconds) so keys are renewed quickly, and fast timers. */
+  lifetimes?: { ike?: number; child?: number };
+  timers?: KeepAliveTimers;
 }
 
 export class Ikev2Tunnel implements Tunnel {
@@ -95,7 +98,7 @@ export class Ikev2Tunnel implements Tunnel {
     const psk = await this.secret('psk', 'Pre-shared key:');
     const password = await this.secret('password', `Password for ${p.username}:`);
     if (this.stopping) throw new Error('Cancelled');
-    const session = new IkeSession({ gateway: p.gateway, psk, localId: p.localId ?? '', userName: p.username, password, log: (t) => this.log(t), ...this.o.session });
+    const session = new IkeSession({ gateway: p.gateway, psk, localId: p.localId ?? '', userName: p.username, password, log: (t) => this.log(t), lifetimes: this.o.lifetimes, ...this.o.session });
     this.session = session;
     try {
       const r = await session.connect();
@@ -109,31 +112,52 @@ export class Ikev2Tunnel implements Tunnel {
       const tun = this.o.tun ? this.o.tun(setup) : helperTun(setup, this.o.helperPipe);
       this.tun = tun;
       await tun.ready;
-      const esp = new Esp(r.child);
+      // During a rekey the old and new ESP SAs both carry packets in for a moment: inbound by SPI, outbound the newest.
+      let out = new Esp(r.child);
+      const inbound = new Map<string, Esp>([[r.child.spiIn.toString('hex'), out]]);
+      const counted = { packetsOut: 0, packetsIn: 0 };
+      const total = (k: 'packetsOut' | 'packetsIn') => counted[k] + [...inbound.values()].reduce((n, e) => n + e[k], 0);
       session.keepAlive(
-        (data) => {
-          if (!esp.isOurs(data)) return;
-          try {
-            const packet = esp.decapsulate(data);
-            if (packet.length) tun.send(packet);
-          } catch (e) {
-            if (++this.dropped <= 5 || this.dropped % 1000 === 0) this.log(`Dropped an incoming packet: ${errorMessage(e)} (${this.dropped} so far)`, 'warning');
-          }
+        {
+          esp: (data) => {
+            const esp = data.length >= 4 ? inbound.get(data.subarray(0, 4).toString('hex')) : undefined;
+            if (!esp?.isOurs(data)) return;
+            try {
+              const packet = esp.decapsulate(data);
+              if (packet.length) tun.send(packet);
+            } catch (e) {
+              if (++this.dropped <= 5 || this.dropped % 1000 === 0) this.log(`Dropped an incoming packet: ${errorMessage(e)} (${this.dropped} so far)`, 'warning');
+            }
+          },
+          gone: (reason) => this.lost(reason),
+          child: (child) => {
+            out = new Esp(child);
+            inbound.set(child.spiIn.toString('hex'), out);
+          },
+          childGone: (spiIn) => {
+            const key = spiIn.toString('hex');
+            const esp = inbound.get(key);
+            if (!esp || esp === out) return;
+            counted.packetsOut += esp.packetsOut;
+            counted.packetsIn += esp.packetsIn;
+            inbound.delete(key);
+          },
         },
-        (reason) => this.lost(reason),
+        this.o.timers,
       );
       tun.onPacket((packet) => {
         // IPv4 only: the tunnel carries what the gateway agreed to, and Windows also sends IPv6 to every adapter.
         if (packet.length < 20 || packet[0] >> 4 !== 4) return;
-        session.sendEsp(esp.encapsulate(packet));
+        session.sendEsp(out.encapsulate(packet));
       });
       tun.onClosed((reason) => reason && this.lost(reason));
       this.up = true;
       // Whether the gateway answers at all shows quickly: say so in the log, where it helps most when pages do not load.
       this.report = setTimeout(() => {
         if (!this.up) return;
-        const line = `Traffic after 15 s: ${esp.packetsOut} packets sent, ${esp.packetsIn} received from the FortiGate${this.dropped ? `, ${this.dropped} dropped` : ''}`;
-        this.log(esp.packetsOut > 0 && esp.packetsIn === 0 ? `${line}. The FortiGate has not answered any traffic yet.` : line, esp.packetsOut > 0 && esp.packetsIn === 0 ? 'warning' : 'info');
+        const [sent, received] = [total('packetsOut'), total('packetsIn')];
+        const line = `Traffic after 15 s: ${sent} packets sent, ${received} received from the FortiGate${this.dropped ? `, ${this.dropped} dropped` : ''}`;
+        this.log(sent > 0 && received === 0 ? `${line}. The FortiGate has not answered any traffic yet.` : line, sent > 0 && received === 0 ? 'warning' : 'info');
       }, 15_000);
       return { device: IKEV2_ADAPTER, address: r.address };
     } catch (e) {

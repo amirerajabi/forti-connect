@@ -914,6 +914,91 @@ describe('IPsec traffic (ESP)', () => {
       await m.shutdown();
     }
   });
+
+  /** A connected Windows IKEv2 profile against the fake gateway; `extra` goes to the tunnel (lifetimes, timers). */
+  const ikeConnected = async (g: Awaited<ReturnType<typeof startFakeGateway>>, extra: Partial<ConstructorParameters<typeof Ikev2Tunnel>[0]> = {}) => {
+    const t = fakeTun();
+    const logs: string[] = [];
+    const m = new Manager(tmpDir(), {
+      platform: 'win32',
+      elevated: false,
+      backends: { ssl: { available: false, kind: 'openconnect', path: null, version: null }, ipsec: { available: true, kind: 'ras', path: null, version: null, modes: ['ikev2', 'l2tp'] }, elevated: false, platform: 'win32' },
+      secretKey: KEY,
+      tunnelFactory: (ctx) => new Ikev2Tunnel({ profile: ctx.profile, secrets: ctx.secrets, hooks: { ...ctx.hooks, log: (l) => (logs.push(l.text), ctx.hooks.log(l)) }, session: { port: g.port, natPort: g.port }, tun: t.make, ...extra }),
+    });
+    await m.load();
+    await m.updateSettings({ reconnect: false });
+    const p = m.addProfile({ name: 'PDN', type: 'ipsec', gateway: '127.0.0.1', port: 443, username: 'azure1', ike: 'ikev2', localId: 'dialup1', savePassword: true, password: 'pw', psk: 'shared' });
+    assert.equal((await m.connect(p.id)).status, 'connected');
+    let n = 0;
+    /** One packet there and back through the tunnel. */
+    const roundTrip = async () => {
+      const packet = Buffer.alloc(64, ++n);
+      packet[0] = 0x45;
+      const before = t.delivered.length;
+      t.inject(packet);
+      await until(() => t.delivered.length === before + 1);
+      assert.ok(t.delivered[before].equals(packet));
+    };
+    return { m, logs, roundTrip };
+  };
+
+  test('the FortiGate renews the IPsec and IKE keys and the tunnel carries on', async () => {
+    const g = await startFakeGateway({ psk: 'shared', userName: 'azure1', password: 'pw' });
+    const { m, logs, roundTrip } = await ikeConnected(g);
+    try {
+      await roundTrip();
+      const first = g.seen.childSpiIn!.toString('hex');
+      // New ESP keys with PFS: the old SA is deleted, packets use the new one both ways.
+      await g.rekeyChild(true);
+      assert.equal(g.seen.espSas, 1);
+      await roundTrip();
+      assert.equal(g.seen.perSpi[first], 1);
+      assert.equal(Object.keys(g.seen.perSpi).length, 2);
+      // New IKE keys: the gateway is the new IKE SA's initiator; its old one is deleted without ending the tunnel.
+      await g.rekeyIke();
+      assert.deepEqual(await g.probe(), []);
+      // ESP keys renewed again, now from the new IKE SA's key (without PFS this time).
+      await g.rekeyChild(false);
+      await roundTrip();
+      assert.equal(Object.keys(g.seen.perSpi).length, 3);
+      assert.equal(m.state().connection.status, 'connected');
+      assert.ok(logs.some((l) => /renewed the IPsec keys \(PFS, DH group 20\)/.test(l)));
+      assert.ok(logs.some((l) => /renewed the IKE keys/.test(l)));
+      // The gateway's DELETE still ends the tunnel on the new IKE SA.
+      await g.deleteIke();
+      await until(() => m.state().connection.status === 'disconnected');
+    } finally {
+      g.close();
+      await m.shutdown();
+    }
+  });
+
+  test('FortiConnect renews the keys itself before their lifetimes end', async () => {
+    // The gateway wants PFS group 21 where FortiConnect offers its IKE group (20) first.
+    const g = await startFakeGateway({ psk: 'shared', userName: 'azure1', password: 'pw', pfsGroup: 21 });
+    const { m, logs, roundTrip } = await ikeConnected(g, { lifetimes: { child: 1.5, ike: 3 }, timers: { rekeyCheckMs: 100 } });
+    try {
+      await until(() => g.seen.clientChildRekeys.length >= 1 && g.seen.clientIkeRekeys >= 1 && g.seen.deletes.includes('old-ike'), 8000);
+      assert.deepEqual([...new Set(g.seen.clientChildRekeys)], [21]);
+      // Each renewal deleted the SA it replaced: only the newest is left at the gateway.
+      assert.ok(g.seen.deletes.some((d) => d.startsWith('esp:')));
+      assert.ok(g.seen.espSas <= 2);
+      await roundTrip();
+      assert.deepEqual(await g.probe(), []);
+      // And once more after the IKE rekey, so ESP keys come from the new IKE SA.
+      const before = g.seen.clientChildRekeys.length;
+      await until(() => g.seen.clientChildRekeys.length > before, 5000);
+      await until(() => g.seen.espSas === 1, 2000);
+      await roundTrip();
+      assert.equal(m.state().connection.status, 'connected');
+      assert.ok(logs.some((l) => /wants DH group 21/.test(l)));
+      assert.ok(logs.some((l) => /^Renewed the IKE keys/.test(l)));
+    } finally {
+      g.close();
+      await m.shutdown();
+    }
+  });
 });
 
 // The helper's adapter mode, for real: the script compiled by PowerShell in test mode, where packets come straight back.
