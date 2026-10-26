@@ -5,6 +5,22 @@ Released: 0.3.1 (tag v0.3.1, 2026-10-26), at https://github.com/amirerajabi/fort
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
 
+## Unreleased (after 0.3.1)
+
+The user's drop test with 0.3.1 against their real FortiGate (2026-10-26, log in the conversation):
+
+- **Worked:** the lost gateway was noticed at once ("OpenConnect lost the gateway … logging in again"), FortiConnect
+  waited for the network ("Waiting for the network" → "answers again" 10 s later) and logged in by itself. A normal
+  Disconnect now ends OpenConnect with Ctrl+C (helper.log: `exited 0`, "Logout successful") and the next connect works
+  on the first try.
+- **Still failed once:** when the drop happens while the network is down, OpenConnect's logout cannot reach the gateway,
+  so the helper kills it after 8 s (helper.log: "did not end after Ctrl+C, killing it") and the next connect hits the
+  half-removed adapter. Now: "Set up tun device failed" / "Could not open|create Wintun adapter" right after connecting
+  is tried again after 1 s (at most twice per connect, also with reconnecting off), without using up a reconnect
+  attempt. Tested with the fake VPN only.
+- The engine test for that retry failed once in the first full run ("no prompt") and passed in 4 full runs and 8 runs of
+  the reconnect tests after; not explained. The test now prints the engine log if it fails again.
+
 ## In 0.3.1
 
 From the user's log of a network drop against their real FortiGate (2026-10-26):
@@ -77,7 +93,7 @@ From the user's log of a network drop against their real FortiGate (2026-10-26):
 
 ## Works (verified on Windows, 2026-10-25)
 
-- `npm run typecheck`, `npm test` (42 engine tests), `npm run check:i18n` (256 strings) and `npm run build` pass.
+- `npm run typecheck`, `npm test` (43 engine tests), `npm run check:i18n` (256 strings) and `npm run build` pass.
 - The engine against a fake OpenConnect (`engine/test/fixtures/fake-vpn.mjs`): saved password answered automatically,
   FortiToken code asked through the UI, password asked and remembered when not saved, an untrusted certificate put to
   the user and its pin saved, a refused password reported in words, disconnecting while a question waits, a dropped

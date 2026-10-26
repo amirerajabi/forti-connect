@@ -3,6 +3,8 @@
 //   node fake-vpn.mjs <mode>   mode: ok | cert | drop | otp-wrong | lost | lost-resumable
 // lost: a gateway that does not let a session resume, then the gateway stops answering and OpenConnect starts its own
 // reconnect loop (it keeps running). lost-resumable: the same loop on a gateway that allows resuming.
+// adapter-busy:<file>: the first run (while <file> does not exist) says it is up, then cannot open its Wintun adapter.
+import * as fs from 'node:fs';
 import * as readline from 'node:readline';
 
 const mode = process.argv[2] ?? 'ok';
@@ -44,6 +46,15 @@ if (mode === 'lost') {
   console.log('be able to reconnect if dead peer is detected. If reconnection DOES work,');
 }
 console.log('Configured as 10.10.0.5, with SSL connected and DTLS in progress');
+if (mode.startsWith('adapter-busy:')) {
+  const marker = mode.slice('adapter-busy:'.length);
+  if (!fs.existsSync(marker)) {
+    fs.writeFileSync(marker, 'tried');
+    console.log("Could not open Wintun adapter 'FortiConnect': Element not found.");
+    console.log('Set up tun device failed');
+    process.exit(1);
+  }
+}
 if (mode === 'lost' || mode === 'lost-resumable') {
   setTimeout(() => {
     console.log('Write error on DTLS session: Error in the push function.');

@@ -33,6 +33,8 @@ import { atomicWrite, errorMessage, newId, readJson } from './util';
 
 const MAX_LOG = 600;
 const RECONNECT_DELAYS = [3, 5, 10, 20, 30];
+/** OpenConnect could not open or create its Wintun adapter ("Set up tun device failed"). */
+const ADAPTER_BUSY = /Set up tun device failed|Could not (open|create) Wintun adapter/i;
 const TEST_PARALLEL = 8;
 
 /** A profile as saved: what the UI sees, minus what is worked out (which secrets are saved). */
@@ -68,6 +70,8 @@ export interface ManagerOptions {
   gatewayReachable?: (host: string, port: number) => Promise<boolean>;
   /** How often to look again while the gateway does not answer, in ms (tests make it short). */
   networkPollMs?: number;
+  /** The wait before trying again when the last adapter was still being removed, in ms (tests make it short). */
+  adapterRetryMs?: number;
 }
 
 const EMPTY_TRAFFIC: Traffic = { up: 0, down: 0, totalUp: 0, totalDown: 0 };
@@ -96,6 +100,8 @@ export class Manager extends EventEmitter {
   /** Bumped when reconnecting is cancelled, so a gateway check still under way does not connect afterwards. */
   private waitToken = 0;
   private retry = 0;
+  /** Quick tries after "the adapter is still being removed" (see onDropped), counted apart from reconnect attempts. */
+  private adapterRetries = 0;
   /** Resets the attempt count once a connection has stayed up: a tunnel that keeps dropping must not retry forever. */
   private stableTimer: NodeJS.Timeout | null = null;
   /** Connect / disconnect run one at a time. */
@@ -493,6 +499,7 @@ export class Manager extends EventEmitter {
   connect(id?: string): Promise<ConnectionState> {
     this.cancelReconnect();
     this.retry = 0;
+    this.adapterRetries = 0;
     return this.queue(() => this.doConnect(id ?? this.selectedId ?? undefined));
   }
 
@@ -603,6 +610,20 @@ export class Manager extends EventEmitter {
     this.forgetLeftover();
     const profileId = this.connection.profileId;
     this.log('error', error);
+    // OpenConnect reports the tunnel up before it opens the adapter. An OpenConnect that had to be killed (its logout
+    // could not reach the gateway) leaves its Wintun adapter being removed for a while, and opening one by the same
+    // name then fails. That is part of connecting, not a drop: try again shortly, whether or not reconnecting is on,
+    // and without using up an attempt.
+    if (profileId && ADAPTER_BUSY.test(error) && this.adapterRetries < 2) {
+      this.adapterRetries++;
+      this.log('app', 'The VPN adapter of the last connection was still being removed: trying again');
+      this.setConnection({ ...IDLE, status: 'connecting', profileId });
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        void this.reconnectWhenReachable(profileId, this.waitToken);
+      }, this.opts.adapterRetryMs ?? 1000);
+      return;
+    }
     this.setConnection({ ...IDLE, profileId, error });
     if (profileId && this.settings.reconnect) this.scheduleReconnect(profileId, error);
     else this.notify('error', 'Disconnected', error);
@@ -655,6 +676,7 @@ export class Manager extends EventEmitter {
     this.stableTimer = setTimeout(() => {
       this.stableTimer = null;
       this.retry = 0;
+      this.adapterRetries = 0;
     }, this.opts.stableAfterMs ?? 60_000);
     this.stableTimer.unref?.();
   }

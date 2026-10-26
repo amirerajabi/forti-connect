@@ -259,6 +259,7 @@ async function fakeManager(mode: string, extra: { reconnect?: boolean; checkCert
     checkCertificates: extra.checkCertificates ?? false,
     gatewayReachable: async () => extra.reachable?.() ?? true,
     networkPollMs: 50,
+    adapterRetryMs: 50,
     tunnelFactory: (ctx) => {
       started.push(ctx.profile);
       return new ProcessTunnel({ file: process.execPath, args: [FAKE_VPN, mode], username: ctx.profile.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: ['node'], stopSignal: 'SIGINT', connectTimeoutMs: 15_000 });
@@ -420,6 +421,29 @@ describe('Manager', () => {
     await new Promise((r) => setTimeout(r, 1000));
     assert.ok(m.state().logs.some((l) => /remaining timeout/.test(l.text)));
     assert.equal(m.state().connection.status, 'connected');
+    await m.disconnect();
+    await m.shutdown();
+  });
+
+  test('an adapter still being removed is tried again at once, even with reconnecting off, using up no attempt', async () => {
+    const marker = path.join(tmpDir(), 'adapter-tried');
+    const { m, events } = await fakeManager(`adapter-busy:${marker}`, { reconnect: false });
+    const p = m.addProfile({ name: 'Office', ...SSL, savePassword: true, password: 'secret' });
+    const first = m.connect(p.id);
+    m.answer((await nextPrompt(m)).id, '123456');
+    await first;
+    // The second run asks for the code again and stays up.
+    const second = await nextPrompt(m).catch((e: Error) => {
+      throw new Error(`${e.message}\n${m.state().logs.map((l) => l.text).join('\n')}\n${JSON.stringify(m.state().connection)}`);
+    });
+    m.answer(second.id, '123456');
+    await new Promise<void>((resolve) => {
+      const check = () => m.state().connection.status === 'connected' && fs.existsSync(marker) && m.state().logs.some((l) => /still being removed/.test(l.text)) && resolve();
+      m.on('event', check);
+      check();
+    });
+    assert.ok(!events.some((e) => e.type === 'connection' && e.connection.retry));
+    assert.ok(!events.some((e) => e.type === 'notify' && e.level === 'error'));
     await m.disconnect();
     await m.shutdown();
   });
