@@ -2,13 +2,15 @@
 // prompt), and a VpnProcess that runs OpenConnect through it, so ProcessTunnel reads prompts and progress exactly as
 // it does from an OpenConnect it started itself.
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import type { HelperInfo } from '../../../../shared/protocol';
 import { powershell, run, sys32 } from '../system';
 import { errorMessage } from '../util';
-import { HELPER_DIR_NAME, HELPER_PIPE, HELPER_VERSION, installScript, removeScript } from './helper-script';
+import { HELPER_DIR_NAME, HELPER_PIPE, HELPER_VERSION, helperPayload, installScript, removeScript } from './helper-script';
 import type { VpnProcess } from './process';
 
 /**
@@ -118,7 +120,14 @@ async function runElevated(script: string): Promise<void> {
 /** Install or update the helper, then wait for it to answer (the task starts it within a few seconds). The OpenConnect
  * FortiConnect ships (FORTICONNECT_BUNDLED_CORE, set by the desktop app) goes with it. */
 export async function installHelper(pipe = HELPER_PIPE, bundledOpenConnect = bundledCore()): Promise<HelperInfo> {
-  await runElevated(installScript(await currentUserSid(), bundledOpenConnect));
+  const payload = helperPayload();
+  const file = path.join(os.tmpdir(), `forticonnect-helper-${process.pid}-${Date.now()}.gz`);
+  fs.writeFileSync(file, payload);
+  try {
+    await runElevated(installScript(await currentUserSid(), bundledOpenConnect, { file, sha256: createHash('sha256').update(payload).digest('hex') }));
+  } finally {
+    fs.rmSync(file, { force: true });
+  }
   const until = Date.now() + 30_000;
   let info = await detectHelper(pipe);
   // PowerShell compiles the helper when it starts: give it time.
@@ -269,23 +278,25 @@ export function helperTun(setup: TunSetup, pipe = HELPER_PIPE): HelperTun {
       if (closing) return void s.destroy();
       s.on('data', (d: Buffer) => {
         buf = buf.length ? Buffer.concat([buf, d]) : d;
-        if (!binary) {
+        // Lines until "tun-ready" (anything that is not one is skipped), then frames.
+        while (!binary) {
           const nl = buf.indexOf(0x0a);
           if (nl < 0) return;
           const line = buf.subarray(0, nl).toString('utf8');
           buf = buf.subarray(nl + 1);
+          let m: { t?: string; message?: string };
           try {
-            const m = JSON.parse(line) as { t?: string; message?: string };
-            if (m.t === 'tun-ready') {
-              binary = true;
-              resolveReady();
-            } else if (m.t === 'error') {
-              failure = `VPN helper: ${m.message ?? 'refused'}`;
-              rejectReady(new Error(failure));
-              s.destroy();
-              return;
-            }
+            m = JSON.parse(line) as typeof m;
           } catch {
+            continue;
+          }
+          if (m.t === 'tun-ready') {
+            binary = true;
+            resolveReady();
+          } else if (m.t === 'error') {
+            failure = `VPN helper: ${m.message ?? 'refused'}`;
+            rejectReady(new Error(failure));
+            s.destroy();
             return;
           }
         }

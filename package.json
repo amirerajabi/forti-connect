@@ -2,7 +2,7 @@
   "name": "forticonnect",
   "private": true,
   "license": "MIT",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "FortiConnect: a simple FortiGate VPN client (SSL-VPN and IPsec) for the desktop (Electron + React + Node engine)",
   "scripts": {
     "setup": "npm --prefix engine install && npm --prefix ui install && npm --prefix desktop install",

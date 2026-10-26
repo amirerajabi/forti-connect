@@ -21,7 +21,7 @@
 import { gzipSync } from 'node:zlib';
 
 /** Bump when the helper changes: an older one installed on a computer is offered as an update. */
-export const HELPER_VERSION = 5;
+export const HELPER_VERSION = 8;
 export const HELPER_PIPE = '\\\\.\\pipe\\forticonnect-helper';
 export const HELPER_TASK = 'FortiConnect VPN helper';
 export const HELPER_DIR_NAME = 'FortiConnect Helper';
@@ -263,6 +263,9 @@ public static class FcHelper {
   [StructLayout(LayoutKind.Sequential)]
   struct ForwardRow { public uint Dest, Mask, Policy, NextHop, IfIndex, Type, Proto, Age, NextHopAS, Metric1, Metric2, Metric3, Metric4, Metric5; }
   [DllImport("iphlpapi.dll")] static extern int GetBestRoute(uint dest, uint source, out ForwardRow row);
+  // MIB_UNICASTIPADDRESS_ROW as 80 bytes: family at 0, IPv4 address at 4, interface index at 40.
+  [DllImport("iphlpapi.dll")] static extern void InitializeUnicastIpAddressEntry(byte[] row);
+  [DllImport("iphlpapi.dll")] static extern int DeleteUnicastIpAddressEntry(byte[] row);
 
   static uint ToAddr(string ip) { return BitConverter.ToUInt32(System.Net.IPAddress.Parse(ip).GetAddressBytes(), 0); }
   static string FromAddr(uint a) { return new System.Net.IPAddress(BitConverter.GetBytes(a)).ToString(); }
@@ -307,7 +310,12 @@ public static class FcHelper {
       c.GatewayIf = best.IfIndex;
       Netsh("interface ipv4 add route prefix=" + c.Gateway + "/32 interface=" + c.GatewayIf + " nexthop=" + c.GatewayNextHop + " metric=1 store=active");
     }
+    FreeAddress(c.Address, c.Index);
+    // No duplicate address detection on a tunnel: nobody else is on it, and while Windows checks, the address is
+    // "tentative" and carries nothing.
+    Netsh("interface ipv4 set interface " + c.Index + " dadtransmits=0 store=active");
     Netsh("interface ipv4 set address name=" + c.Index + " source=static address=" + c.Address + " mask=" + c.Netmask);
+    WaitUsable(c.Address, c.Index);
     Netsh("interface ipv4 set subinterface " + c.Index + " mtu=" + c.Mtu + " store=active");
     Netsh("interface ipv4 set interface " + c.Index + " metric=1 store=active");
     if (c.Dns.Count > 0) {
@@ -315,6 +323,49 @@ public static class FcHelper {
       for (int i = 1; i < c.Dns.Count; i++) Netsh("interface ipv4 add dnsservers name=" + c.Index + " address=" + c.Dns[i] + " index=" + (i + 1) + " validate=no");
     }
     foreach (string[] r in c.Routes) Netsh("interface ipv4 add route prefix=" + r[0] + "/" + r[1] + " interface=" + c.Index + " nexthop=0.0.0.0 metric=1 store=active");
+  }
+
+  /**
+   * Windows puts an address on one adapter only. FortiClient's adapter keeps the last address it got (the same one the
+   * FortiGate hands out again) after it disconnects, and then ours cannot have it: take it off that adapter first.
+   */
+  static void FreeAddress(string address, uint ours) {
+    foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()) {
+      System.Net.NetworkInformation.IPInterfaceProperties props = ni.GetIPProperties();
+      System.Net.NetworkInformation.IPv4InterfaceProperties v4 = null;
+      try { v4 = props.GetIPv4Properties(); } catch { }
+      if (v4 == null || (uint)v4.Index == ours) continue;
+      foreach (System.Net.NetworkInformation.UnicastIPAddressInformation ua in props.UnicastAddresses) {
+        if (ua.Address.ToString() != address) continue;
+        // DeleteUnicastIpAddressEntry, not netsh: netsh cannot remove an address that came from DHCP, and FortiClient's
+        // adapter gets its address that way.
+        byte[] row = new byte[80];
+        InitializeUnicastIpAddressEntry(row);
+        row[0] = 2;
+        byte[] ip = ua.Address.GetAddressBytes();
+        Array.Copy(ip, 0, row, 4, 4);
+        BitConverter.GetBytes((uint)v4.Index).CopyTo(row, 40);
+        int err = DeleteUnicastIpAddressEntry(row);
+        Log("the address " + address + " was still on \\"" + ni.Name + "\\" (" + v4.Index + "): " + (err == 0 ? "taken off there" : "could not take it off (" + err + ")"));
+      }
+    }
+  }
+
+  /** Wait (up to 5 s) until Windows lets the address carry traffic ("preferred"), so "ready" means ready. */
+  static void WaitUsable(string address, uint index) {
+    for (int i = 0; i < 50; i++) {
+      foreach (System.Net.NetworkInformation.NetworkInterface ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()) {
+        System.Net.NetworkInformation.IPInterfaceProperties props = ni.GetIPProperties();
+        System.Net.NetworkInformation.IPv4InterfaceProperties v4 = null;
+        try { v4 = props.GetIPv4Properties(); } catch { }
+        if (v4 == null || (uint)v4.Index != index) continue;
+        foreach (System.Net.NetworkInformation.UnicastIPAddressInformation ua in props.UnicastAddresses) {
+          if (ua.Address.ToString() == address && ua.DuplicateAddressDetectionState == System.Net.NetworkInformation.DuplicateAddressDetectionState.Preferred) return;
+        }
+      }
+      Thread.Sleep(100);
+    }
+    Log("the address " + address + " is not usable yet after 5 s");
   }
 
   /** Everything Configure did, undone; the adapter itself stays for the next connection. */
@@ -412,10 +463,12 @@ public static class FcHelper {
           }
         });
         fromAdapter.IsBackground = true;
-        fromAdapter.Start();
       }
       Log("tun up: " + c.Address + " on interface " + c.Index + ", routes " + c.Routes.Count + (c.GatewayNextHop != null ? ", gateway via " + c.GatewayNextHop : ""));
+      // The line first, then the frames: Windows sends packets to a new adapter at once, and a frame written before this
+      // line would garble it.
       conn.Send("tun-ready", "index", (int)c.Index);
+      if (fromAdapter != null) fromAdapter.Start();
       byte[] head = new byte[2];
       byte[] packet = new byte[65535];
       while (ReadFull(pipe, head, 2)) {
@@ -587,6 +640,11 @@ function compact(source: string): string {
     .join('\n');
 }
 
+/** The helper as the install script takes it: fc-helper.ps1, gzipped. */
+export function helperPayload(): Buffer {
+  return gzipSync(Buffer.from(HELPER_PS1, 'utf8'), { level: 9 });
+}
+
 /** The helper itself: fc-helper.ps1. users.txt beside it lists the Windows accounts (SIDs) allowed to use it. */
 export const HELPER_PS1 = `param([string]$PipeName = 'forticonnect-helper', [string]$TestCommand = '', [string]$WorkDir = '')
 $ErrorActionPreference = 'Stop'
@@ -602,10 +660,13 @@ ${compact(CSHARP)}
 
 /**
  * What runs elevated (one UAC prompt) to install or update the helper: copy it to Program Files, add the user to
- * users.txt, and (re)register the SYSTEM task that starts it at boot. Sent as -EncodedCommand, not as a file, so nothing
- * on disk can be swapped between the user's consent and the copy. Errors land in work\install-error.txt.
+ * users.txt, and (re)register the SYSTEM task that starts it at boot. The script travels as -EncodedCommand; the
+ * helper itself (gzipped, too big for a command line, which Windows caps at 32767 characters) is a file the script only
+ * installs if its SHA-256 matches the one written into the script, so nothing can be swapped between the user's consent
+ * and the copy. Errors land in work\install-error.txt.
  */
-export function installScript(userSid: string, bundledOpenConnect: string | null = null): string {
+export function installScript(userSid: string, bundledOpenConnect: string | null = null, payload: { file: string; sha256: string } = { file: '', sha256: '' }): string {
+  if (!/^[0-9a-f]{64}$/.test(payload.sha256) || !payload.file || /[\r\n]/.test(payload.file)) throw new Error('The helper file to install is missing');
   if (!/^S-1-[0-9-]+$/.test(userSid)) throw new Error('Could not read your Windows account id');
   if (bundledOpenConnect !== null && !/^[^'"`$\r\n]+$/.test(bundledOpenConnect)) throw new Error('Unusual characters in the OpenConnect folder path');
   // The OpenConnect FortiConnect ships: copied next to the helper, where only administrators can change it.
@@ -619,8 +680,8 @@ export function installScript(userSid: string, bundledOpenConnect: string | null
   }
 `
     : '';
-  // Gzipped: the whole script travels as -EncodedCommand, and Windows caps a command line at 32767 characters.
-  const b64 = gzipSync(Buffer.from(HELPER_PS1, 'utf8'), { level: 9 }).toString('base64');
+  // A single-quoted PowerShell string: a ' inside is written twice.
+  const file = `'${payload.file.replace(/'/g, "''")}'`;
   return `$ErrorActionPreference = 'Stop'
 $dir = Join-Path $env:ProgramFiles '${HELPER_DIR_NAME}'
 $work = Join-Path $dir 'work'
@@ -631,7 +692,10 @@ try {
   Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
   Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.CommandLine -like '*fc-helper.ps1*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   $script = Join-Path $dir 'fc-helper.ps1'
-  $gz = New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(,[Convert]::FromBase64String('${b64}'))), [IO.Compression.CompressionMode]::Decompress)
+  $bytes = [IO.File]::ReadAllBytes(${file})
+  $sha = -join ((New-Object Security.Cryptography.SHA256Managed).ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+  if ($sha -ne '${payload.sha256}') { throw 'The helper file changed before it could be installed' }
+  $gz = New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream(,$bytes)), [IO.Compression.CompressionMode]::Decompress)
   $text = (New-Object IO.StreamReader($gz, [Text.Encoding]::UTF8)).ReadToEnd()
   [IO.File]::WriteAllText($script, $text, (New-Object Text.UTF8Encoding $true))
   $usersFile = Join-Path $dir 'users.txt'
@@ -645,12 +709,15 @@ ${copyOpenConnect}  $ps = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell
   $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
   Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-  Start-ScheduledTask -TaskName $name
-  exit 0
+  $code = 0
 } catch {
   try { Set-Content -Path (Join-Path $work 'install-error.txt') -Value $_.Exception.Message } catch { }
-  exit 1
+  $code = 1
+} finally {
+  # Whatever happened above, the helper runs again (the old one, if the new one could not be written).
+  Start-ScheduledTask -TaskName '${HELPER_TASK}' -ErrorAction SilentlyContinue
 }
+exit $code
 `;
 }
 

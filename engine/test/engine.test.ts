@@ -3,7 +3,7 @@
 // what OpenConnect asks. Nothing here starts a real VPN, touches the network outside 127.0.0.1, or needs admin rights.
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { X509Certificate } from 'node:crypto';
+import { createHash, X509Certificate } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -15,7 +15,7 @@ import { charonArgs, charonCommand, charonDialect, shellQuote } from '../src/cor
 import { ADMIN_PROMPT, openconnectArgs, openconnectDialect, parseVersion, withSudo } from '../src/core/backends/openconnect';
 import { ProcessTunnel } from '../src/core/backends/process';
 import { detectHelper, helloHelper, helperProcess } from '../src/core/backends/helper';
-import { HELPER_PS1, HELPER_VERSION, installScript } from '../src/core/backends/helper-script';
+import { HELPER_PS1, HELPER_VERSION, helperPayload, installScript } from '../src/core/backends/helper-script';
 import { createEnv, entryName, rasError } from '../src/core/backends/ras';
 import { Manager } from '../src/core/Manager';
 import { certPin, checkGateway } from '../src/core/net';
@@ -676,19 +676,25 @@ describe('PowerShell on Windows', { skip: process.platform !== 'win32' }, () => 
   });
 });
 
-test('the elevated install script embeds the helper and only takes a real account id', () => {
+test('the elevated install script checks the helper file by SHA-256 and only takes a real account id', () => {
+  const payload = helperPayload();
+  assert.equal(gunzipSync(payload).toString('utf8'), HELPER_PS1);
+  const sha256 = createHash('sha256').update(payload).digest('hex');
+  const p = { file: "C:\\Users\\o'neil\\AppData\\Local\\Temp\\forticonnect-helper.gz", sha256 };
   // The OpenConnect FortiConnect ships is copied next to the helper; a path that could break out of the quotes is refused.
-  assert.match(installScript('S-1-5-21-1-2-3-1001', 'C:\\Users\\a\\AppData\\Local\\Programs\\FortiConnect\\resources\\core'), /\$from = 'C:\\Users\\a\\AppData\\Local\\Programs\\FortiConnect\\resources\\core'[\s\S]*Copy-Item -Destination \$oc/);
-  assert.throws(() => installScript('S-1-5-21-1-2-3-1001', "C:\\x'; Remove-Item C:\\ -Recurse; '"), /Unusual characters/);
-  assert.doesNotMatch(installScript('S-1-5-21-1-2-3-1001'), /Copy-Item/);
-  const s = installScript('S-1-5-21-1-2-3-1001');
+  assert.match(installScript('S-1-5-21-1-2-3-1001', 'C:\\Users\\a\\AppData\\Local\\Programs\\FortiConnect\\resources\\core', p), /\$from = 'C:\\Users\\a\\AppData\\Local\\Programs\\FortiConnect\\resources\\core'[\s\S]*Copy-Item -Destination \$oc/);
+  assert.throws(() => installScript('S-1-5-21-1-2-3-1001', "C:\\x'; Remove-Item C:\\ -Recurse; '", p), /Unusual characters/);
+  assert.doesNotMatch(installScript('S-1-5-21-1-2-3-1001', null, p), /Copy-Item/);
+  const s = installScript('S-1-5-21-1-2-3-1001', null, p);
   assert.match(s, /Register-ScheduledTask/);
   assert.match(s, /'S-1-5-21-1-2-3-1001'/);
-  const embedded = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(s)![1];
-  assert.equal(gunzipSync(Buffer.from(embedded, 'base64')).toString('utf8'), HELPER_PS1);
-  assert.throws(() => installScript("S-1-5'; Remove-Item C:\\ -Recurse; '"), /account id/);
-  // It travels as -EncodedCommand, which Windows caps at 32767 characters for the whole command line.
-  assert.ok(Buffer.from(s, 'utf16le').toString('base64').length < 30_000, `the encoded install script is too long: ${Buffer.from(s, 'utf16le').toString('base64').length}`);
+  // The file name in single quotes, its quote doubled; the hash it must have.
+  assert.ok(s.includes("ReadAllBytes('C:\\Users\\o''neil\\AppData\\Local\\Temp\\forticonnect-helper.gz')"));
+  assert.ok(s.includes(`if ($sha -ne '${sha256}')`));
+  assert.throws(() => installScript("S-1-5'; Remove-Item C:\\ -Recurse; '", null, p), /account id/);
+  assert.throws(() => installScript('S-1-5-21-1-2-3-1001', null, { file: 'x', sha256: 'not-a-hash' }), /missing/);
+  // The script travels as -EncodedCommand (Windows caps a command line at 32767 characters): the helper is not in it.
+  assert.ok(Buffer.from(s, 'utf16le').toString('base64').length < 12_000, `the encoded install script is too long: ${Buffer.from(s, 'utf16le').toString('base64').length}`);
 });
 
 describe('HTTP API', () => {

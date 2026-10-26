@@ -1,9 +1,32 @@
 # Status
 
-Released: 0.5.1 (tag v0.5.1, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.5.0, 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
+Released: 0.5.2 (tag v0.5.2, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.5.1, 0.5.0, 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
 0.1.0 (the first release), all on 2026-10-25. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.5.2: helper v8 (connect no longer hangs at "Setting up the VPN adapter")
+
+The user's test of 0.5.1: the FortiGate now names its networks (192.168.57.0/25 and six /32s), but connecting hung at
+"Setting up the VPN adapter". The helper had finished in 2 s; the client never read "tun-ready" because the helper
+started passing Windows' packets before writing that line, and binary frames garbled it (the echo test mode sends no
+packets of its own, so the tests could not see it). Also, 192.168.4.11 was still on FortiClient's adapter ("Ethernet 3",
+a stale DHCP address), so Windows refused it on ours.
+
+- Helper v6–v8: "tun-ready" is written before any frame; an address still on another adapter is removed there with
+  DeleteUnicastIpAddressEntry (netsh cannot remove a DHCP address); duplicate address detection is off on the tunnel and
+  "ready" waits until the address is usable. The client skips anything that is not a line until "tun-ready".
+- The install script no longer carries the helper (it no longer fits a command line): the helper goes to a temp file
+  whose SHA-256 is in the elevated script, which refuses a file that does not match. The script always starts the
+  helper again at the end, even after an error.
+- **Checked on the user's PC** (helper v8 installed): with the address 192.168.4.11 and a harmless network: the stale
+  address was taken off FortiClient's adapter, "ready" after ~3.7 s with the address "Preferred", 182 packets from
+  Windows through the pipe, the network routed into the adapter, all removed on disconnect.
+- **Working end to end with the real FortiGate** (2026-10-26, the user's 0.5.1 with helper v8, checked from this
+  machine while connected): 192.168.4.11 preferred on "FortiConnect IPsec", 192.168.57.16 routed into it, ping answered,
+  TCP 8080 open, `http://192.168.57.16:8080/tfs/` answered 401 (Windows login, as TFS asks), ~25 KB back through the
+  tunnel. The first IPsec traffic FortiConnect's own engine carried. Still to do (step 3): rekeying (the child SA
+  expires after 43200 s, so a tunnel drops after ~12 h), reconnecting on a lost tunnel tested against the real gateway.
 
 ## In 0.5.1: the IPsec adapter set up by the helper itself
 
