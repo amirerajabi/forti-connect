@@ -1,9 +1,32 @@
 # Status
 
-Released: 0.3.2 (tag v0.3.2, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
+Released: 0.4.0 (tag v0.4.0, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
 0.1.0 (the first release), all on 2026-10-25. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.4.0: IPsec IKEv2 on Windows with FortiConnect's own engine (step 1 of 3)
+
+The user's second FortiGate (178.252.144.146, "PDN") is an IPsec dial-up tunnel set up for FortiClient: IKEv2, the
+gateway proves itself with a pre-shared key, the user logs in with EAP (user name + password), mode config hands out
+the address, local ID `dialup1`; phase 1 AES256 with SHA384/SHA256, DH 20/21; phase 2 AES256 SHA256/SHA384, PFS DH 20.
+Windows' own client cannot do PSK + EAP (it wants a gateway certificate), and strongSwan's Windows port cannot take a
+virtual IP (`kernel_iph_net.c`: `add_ip` returns NOT_SUPPORTED; `tun_device.c` has no Windows TUN). So FortiConnect
+gets its own IKEv2 initiator (`engine/src/core/ikev2/`):
+
+- **Step 1, login (done):** IKE_SA_INIT, IKE_AUTH with the gateway's PSK proof, EAP-MSCHAPv2 (MD4 and DES written out,
+  since OpenSSL 3 dropped them; RFC 2759 / 3079 vectors pass), the final AUTH with the MSK, mode config, ESP keys. It
+  always floats to UDP 4500 and claims a NAT (source hash of 0.0.0.0) so ESP will travel in UDP. Tests run it against a
+  fake gateway written from the RFCs. Against the real gateway, with a dummy key and no password: it accepted AES256 /
+  SHA384 / DH 20, answered on 4500, took `dialup1` as a key ID and sent its PSK proof (which our dummy key did not match,
+  as expected). A full login with the real key and password has not been done.
+- In the app, a Windows IPsec profile with IKEv2 now uses this engine (L2TP still uses Windows' client). It logs in,
+  reports "the login worked (VPN address …)", signs out (DELETE) and stops, since there is no data path yet. The profile
+  dialog now asks for the pre-shared key and local ID for IKEv2 too.
+- **Step 2, traffic (next):** ESP (AES-256-CBC + HMAC) in UDP 4500 between the gateway and the VPN helper's Wintun
+  adapter, the VPN address and routes (from TSr / INTERNAL_IP4_SUBNET) and DNS on the adapter.
+- **Step 3:** dead peer detection, answering the gateway's INFORMATIONAL requests, rekeying (CREATE_CHILD_SA with PFS
+  DH 20; IKE SA life 86400 s, child 43200 s), reconnecting.
 
 ## In 0.3.2
 

@@ -61,8 +61,9 @@ export function normalizeConfig(p: Partial<ProfileConfig>, base?: ProfileConfig)
     if (cert) c.clientCert = cert;
   } else {
     c.ike = IKE.includes(p.ike as IkeMode) ? (p.ike as IkeMode) : (base?.ike ?? 'ikev1');
-    if (c.ike === 'ikev1') {
-      c.aggressive = typeof p.aggressive === 'boolean' ? p.aggressive : (base?.aggressive ?? true);
+    if (c.ike === 'ikev1') c.aggressive = typeof p.aggressive === 'boolean' ? p.aggressive : (base?.aggressive ?? true);
+    // The FortiGate picks the dial-up tunnel by this ID (IKEv1 peer ID, IKEv2 IDi; FortiClient's "Local ID").
+    if (c.ike !== 'l2tp') {
       const id = text(p.localId ?? base?.localId, 200);
       if (id) c.localId = id;
     }

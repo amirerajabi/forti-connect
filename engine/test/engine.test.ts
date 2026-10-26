@@ -25,6 +25,12 @@ import { defaultSettings, mergeSettings } from '../src/core/settings';
 import { CounterWatcher, parseNetstat, type Counters } from '../src/core/traffic';
 import { powershell } from '../src/core/system';
 import { createServer, ENGINE_VERSION } from '../src/http/server';
+import { decryptSk, encryptSk, icv, prf, prfPlus } from '../src/core/ikev2/crypto';
+import { authenticatorResponse, desEncryptBlock, generateNtResponse, masterKey, md4 } from '../src/core/ikev2/mschapv2';
+import { PRF_HMAC_SHA2_384 } from '../src/core/ikev2/payloads';
+import { IkeSession } from '../src/core/ikev2/session';
+import { startFakeGateway } from './fixtures/fake-ikev2-gateway';
+import { Ikev2Tunnel } from '../src/core/backends/ikev2';
 
 const FIXTURES = path.join(import.meta.dirname, 'fixtures');
 const FAKE_VPN = path.join(FIXTURES, 'fake-vpn.mjs');
@@ -712,4 +718,102 @@ describe('HTTP API', () => {
       await m.shutdown();
     }
   });
+});
+
+// The built-in IKEv2 engine (Windows IPsec like FortiClient's): the primitives against the RFC test vectors, and whole
+// logins against a fake FortiGate written from the RFCs. The real gateway has only been checked up to its proof of
+// the pre-shared key (with a dummy key); a full login against it needs the user's own key and password.
+describe('IKEv2 engine', () => {
+  const hex = (s: string) => Buffer.from(s, 'hex');
+
+  test('MD4, DES and MS-CHAPv2 match RFC 1320 / FIPS 46 / RFC 2759 / RFC 3079', () => {
+    assert.equal(md4(Buffer.alloc(0)).toString('hex'), '31d6cfe0d16ae931b73c59d7e0c089c0');
+    assert.equal(md4(Buffer.from('abc')).toString('hex'), 'a448017aaf21d8525fc10ae87aa6729d');
+    assert.equal(desEncryptBlock(hex('133457799BBCDFF1'), hex('0123456789ABCDEF')).toString('hex'), '85e813540f0ab405');
+    const authC = hex('5B5D7C7D7B3F2F3E3C2C602132262628');
+    const peerC = hex('21402324255E262A28295F2B3A337C7E');
+    const nt = generateNtResponse(authC, peerC, 'User', 'clientPass');
+    assert.equal(nt.toString('hex'), '82309ecd8d708b5ea08faa3981cd83544233114a3d85d6df');
+    assert.equal(authenticatorResponse('clientPass', nt, peerC, authC, 'User'), 'S=407A5589115FD0D6209F510FE9C04566932CDA56');
+    assert.equal(masterKey('clientPass', nt).toString('hex'), 'fdece3717a8c838cb388e527ae3cdd31');
+  });
+
+  test('prf+ and the SK payload round-trip', () => {
+    const k = prfPlus(PRF_HMAC_SHA2_384, Buffer.alloc(48, 1), Buffer.from('seed'), 200);
+    assert.equal(k.length, 200);
+    assert.ok(k.subarray(0, 48).equals(prf(PRF_HMAC_SHA2_384, Buffer.alloc(48, 1), Buffer.concat([Buffer.from('seed'), Buffer.from([1])]))));
+    const suite = { encr: { id: 12 as const, keyLength: 256 as const }, integ: 13, prf: PRF_HMAC_SHA2_384 };
+    const enc = Buffer.alloc(32, 2);
+    const integ = Buffer.alloc(48, 3);
+    const inner = Buffer.from('hello IKE payloads');
+    const body = encryptSk(suite, enc, inner);
+    const head = Buffer.alloc(32);
+    const unsigned = Buffer.concat([head, body]);
+    const message = Buffer.concat([unsigned, icv(suite, integ, unsigned)]);
+    assert.ok(decryptSk(suite, enc, integ, message, Buffer.concat([body, icv(suite, integ, unsigned)])).equals(inner));
+    const tampered = Buffer.from(message);
+    tampered[40] ^= 1;
+    assert.throws(() => decryptSk(suite, enc, integ, tampered, tampered.subarray(32)), /integrity/);
+  });
+
+  const login = async (gw: { psk: string; password: string; group?: number }, mine: { psk: string; password: string }) => {
+    const g = await startFakeGateway({ psk: gw.psk, userName: 'azure1', password: gw.password, group: gw.group });
+    const logs: string[] = [];
+    const s = new IkeSession({ gateway: '127.0.0.1', port: g.port, natPort: g.port, psk: mine.psk, localId: 'dialup1', userName: 'azure1', password: mine.password, log: (t) => logs.push(t), timeoutMs: 300 });
+    try {
+      return { result: await s.connect(), g, logs };
+    } finally {
+      s.close();
+      g.close();
+    }
+  };
+
+  test('logs in like FortiClient: pre-shared key, EAP-MSCHAPv2, VPN address, ESP keys', async () => {
+    const { result, g, logs } = await login({ psk: 'shared-secret', password: 'pass word' }, { psk: 'shared-secret', password: 'pass word' });
+    assert.equal(g.seen.idi, 'dialup1');
+    assert.equal(g.seen.idType, 11);
+    assert.equal(result.address, '10.212.134.5');
+    assert.deepEqual(result.dns, ['10.0.0.53']);
+    assert.deepEqual(result.networks, [{ start: '10.0.0.0', end: '10.255.255.255' }]);
+    assert.ok(result.udpEncapsulation);
+    // Both ends derived the same ESP keys, and each knows the other's SPI.
+    assert.ok(result.child.spiOut.equals(g.seen.childSpiIn!));
+    assert.ok(result.child.encrOut.equals(g.seen.childKeys!.encrOut));
+    assert.ok(result.child.integIn.equals(g.seen.childKeys!.integIn));
+    assert.ok(logs.some((l) => /EAP-MSCHAPv2 accepted/.test(l)));
+    assert.ok(!logs.join('\n').includes('pass word') && !logs.join('\n').includes('shared-secret'));
+  });
+
+  test('a wrong pre-shared key or password is said in words', async () => {
+    await assert.rejects(login({ psk: 'right', password: 'p' }, { psk: 'wrong', password: 'p' }), /pre-shared key does not match/);
+    await assert.rejects(login({ psk: 'k', password: 'right' }, { psk: 'k', password: 'wrong' }), /refused the user name or password/);
+  });
+
+  test('asks again with the DH group the gateway wants', async () => {
+    const { result, logs } = await login({ psk: 'k', password: 'p', group: 21 }, { psk: 'k', password: 'p' });
+    assert.equal(result.address, '10.212.134.5');
+    assert.ok(logs.some((l) => /prefers DH group 21/.test(l)));
+  });
+});
+
+test('Windows IKEv2 profiles log in with the built-in engine and report it (traffic is the next step)', async () => {
+  const g = await startFakeGateway({ psk: 'shared', userName: 'azure1', password: 'pw' });
+  const m = new Manager(tmpDir(), {
+    platform: 'win32',
+    elevated: false,
+    backends: { ssl: { available: false, kind: 'openconnect', path: null, version: null }, ipsec: { available: true, kind: 'ras', path: null, version: null, modes: ['ikev2', 'l2tp'] }, elevated: false, platform: 'win32' },
+    secretKey: KEY,
+    tunnelFactory: (ctx) => new Ikev2Tunnel({ profile: ctx.profile, secrets: ctx.secrets, hooks: ctx.hooks, session: { port: g.port, natPort: g.port } }),
+  });
+  await m.load();
+  try {
+    const p = m.addProfile({ name: 'PDN', type: 'ipsec', gateway: '127.0.0.1', port: 443, username: 'azure1', ike: 'ikev2', localId: 'dialup1', savePassword: true, password: 'pw', psk: 'shared' });
+    assert.equal(m.getProfile(p.id)!.localId, 'dialup1');
+    await assert.rejects(m.connect(p.id), /the login worked \(VPN address 10\.212\.134\.5\)/);
+    assert.equal(g.seen.idi, 'dialup1');
+    assert.ok(m.state().logs.some((l) => /Logged in to the FortiGate with IPsec/.test(l.text)));
+  } finally {
+    g.close();
+    await m.shutdown();
+  }
 });

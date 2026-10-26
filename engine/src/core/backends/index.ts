@@ -10,6 +10,7 @@ import { charonArgs, charonCommand, charonDialect, detectCharon } from './charon
 import { bundledCore, detectHelper, helperProcess } from './helper';
 import { HELPER_PIPE } from './helper-script';
 import { ADAPTER, detectOpenconnect, findVpncScript, openconnectArgs, openconnectDialect, withSudo } from './openconnect';
+import { Ikev2Tunnel } from './ikev2';
 import { ProcessTunnel } from './process';
 import { detectRas, RasTunnel } from './ras';
 import type { Tunnel, TunnelHooks } from './types';
@@ -75,6 +76,8 @@ export const createTunnel: TunnelFactory = (ctx) => {
   }
   if (platform === 'win32') {
     if (p.ike === 'ikev1') throw new Error("Windows' own VPN client has no IKEv1 + XAuth. Use IKEv2 or L2TP/IPsec for this profile (and enable it on the FortiGate), or connect with SSL-VPN.");
+    // IKEv2 as FortiClient does it (pre-shared key + EAP) is something Windows' own client cannot do: FortiConnect's engine.
+    if (p.ike === 'ikev2') return new Ikev2Tunnel({ profile: p, secrets: ctx.secrets, hooks: ctx.hooks });
     return new RasTunnel({ profile: p, secrets: ctx.secrets, hooks: ctx.hooks });
   }
   if (p.ike === 'l2tp') throw new Error('L2TP/IPsec is only available on Windows. Use IKEv1 or IKEv2 for this profile.');

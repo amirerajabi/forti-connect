@@ -67,7 +67,8 @@ function ProfileForm({ id }: { id: string | null }) {
   if (id && !existing) return null;
   const ssl = f.type === 'ssl';
   const ike = f.ike ?? 'ikev1';
-  const needsPsk = !ssl && ike !== 'ikev2';
+  // FortiGate dial-up tunnels use a pre-shared key in every IPsec mode (IKEv2 as FortiClient does it, too).
+  const needsPsk = !ssl;
   const supported = backends.ipsec.modes;
 
   const runCheck = async () => {
@@ -265,18 +266,18 @@ function ProfileForm({ id }: { id: string | null }) {
               </Field>
             )}
             {ike === 'ikev1' && (
-              <>
-                <label className="toggle-row">
-                  <input type="checkbox" className="switch" checked={!!f.aggressive} onChange={(e) => set({ aggressive: e.target.checked })} />
-                  <span>
-                    <span className="toggle-label">{t('Aggressive mode')}</span>
-                    <span className="field-hint">{t('Needed when the FortiGate tunnel matches a peer ID (local ID below).')}</span>
-                  </span>
-                </label>
-                <Field label={t('Local ID')} hint={t('The peer ID the FortiGate expects; empty uses your user name.')}>
-                  <input className="input mono-sm" dir="ltr" value={f.localId ?? ''} spellCheck={false} onChange={(e) => set({ localId: e.target.value })} />
-                </Field>
-              </>
+              <label className="toggle-row">
+                <input type="checkbox" className="switch" checked={!!f.aggressive} onChange={(e) => set({ aggressive: e.target.checked })} />
+                <span>
+                  <span className="toggle-label">{t('Aggressive mode')}</span>
+                  <span className="field-hint">{t('Needed when the FortiGate tunnel matches a peer ID (local ID below).')}</span>
+                </span>
+              </label>
+            )}
+            {ike !== 'l2tp' && (
+              <Field label={t('Local ID')} hint={t('The peer ID the FortiGate expects; empty uses your user name.')}>
+                <input className="input mono-sm" dir="ltr" value={f.localId ?? ''} spellCheck={false} onChange={(e) => set({ localId: e.target.value })} />
+              </Field>
             )}
             <Field label={t('Networks through the VPN')} hint={t('Separated by commas, like 10.0.0.0/8, 192.168.10.0/24. Empty sends all traffic through the VPN.')}>
               <textarea className="input textarea mono-sm" dir="ltr" rows={2} spellCheck={false} value={routes} onChange={(e) => setRoutes(e.target.value)} />
