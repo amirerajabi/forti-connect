@@ -13,15 +13,15 @@
 // Written in C# compiled by PowerShell at start (Add-Type): both ship with every Windows 10 / 11, nothing to install.
 // Lines on the pipe are JSON. Client → helper: {op:'hello'} | {op:'start', ...} | {op:'stdin', d} | {op:'stop'}.
 // Helper → client: {t:'hello', version} | {t:'out'|'err', d} | {t:'exit', code} | {t:'error', message}.
-// For FortiConnect's own IPsec engine: {op:'tun', address, netmask, dns, gateway, split, mtu} makes the helper open the
-// Wintun adapter and set it up with OpenConnect's vpnc-script; it answers {t:'tun-ready', index}, and from then on both
+// For FortiConnect's own IPsec engine: {op:'tun', address, netmask, dns, gateway, split, mtu} makes the helper open its
+// "FortiConnect IPsec" Wintun adapter and set its address, DNS and routes; it answers {t:'tun-ready', index}, and from then on both
 // sides send IP packets as frames (two bytes of length, big-endian, then the packet) until the client closes the pipe.
 // The client sends no frame before tun-ready, so nothing binary is ever read as a line.
 
 import { gzipSync } from 'node:zlib';
 
 /** Bump when the helper changes: an older one installed on a computer is offered as an update. */
-export const HELPER_VERSION = 4;
+export const HELPER_VERSION = 5;
 export const HELPER_PIPE = '\\\\.\\pipe\\forticonnect-helper';
 export const HELPER_TASK = 'FortiConnect VPN helper';
 export const HELPER_DIR_NAME = 'FortiConnect Helper';
@@ -260,50 +260,120 @@ public static class FcHelper {
     return true;
   }
 
-  /** vpnc-script-win.js, the one OpenConnect ships next to itself, with the environment OpenConnect gives it. */
-  static void RunScript(string reason, Dictionary<string, string> env, string dir) {
-    string script = Path.Combine(dir, "vpnc-script-win.js");
-    ProcessStartInfo psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cscript.exe"), "//nologo \\"" + script + "\\"");
+  [StructLayout(LayoutKind.Sequential)]
+  struct ForwardRow { public uint Dest, Mask, Policy, NextHop, IfIndex, Type, Proto, Age, NextHopAS, Metric1, Metric2, Metric3, Metric4, Metric5; }
+  [DllImport("iphlpapi.dll")] static extern int GetBestRoute(uint dest, uint source, out ForwardRow row);
+
+  static uint ToAddr(string ip) { return BitConverter.ToUInt32(System.Net.IPAddress.Parse(ip).GetAddressBytes(), 0); }
+  static string FromAddr(uint a) { return new System.Net.IPAddress(BitConverter.GetBytes(a)).ToString(); }
+
+  /** netsh by full path, arguments built only from checked values. A failure is logged, the setup goes on. */
+  static bool Netsh(string args) {
+    ProcessStartInfo psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "netsh.exe"), args);
     psi.UseShellExecute = false;
     psi.CreateNoWindow = true;
     psi.RedirectStandardOutput = true;
     psi.RedirectStandardError = true;
-    psi.WorkingDirectory = dir;
-    foreach (KeyValuePair<string, string> kv in env) psi.EnvironmentVariables[kv.Key] = kv.Value;
-    psi.EnvironmentVariables["reason"] = reason;
     using (Process p = Process.Start(psi)) {
       string output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
-      if (!p.WaitForExit(60000)) { try { p.Kill(); } catch { } }
-      Log("vpnc-script " + reason + ": " + output.Replace("\\r\\n", " | "));
+      if (!p.WaitForExit(15000)) { try { p.Kill(); } catch { } return false; }
+      if (p.ExitCode != 0) Log("netsh " + args + " -> " + p.ExitCode + ": " + output.Trim());
+      return p.ExitCode == 0;
     }
   }
 
+  class TunConfig {
+    public uint Index;
+    public string Address;
+    public string Netmask;
+    public string Gateway;
+    public string GatewayNextHop;
+    public uint GatewayIf;
+    public int Mtu;
+    public List<string> Dns = new List<string>();
+    /** Networks through the tunnel: address and prefix length. */
+    public List<string[]> Routes = new List<string[]>();
+  }
+
   /**
-   * Open the FortiConnect adapter, give it the address, routes and DNS the gateway handed out, and carry packets between
-   * it and the client until the client closes the pipe; then undo the setup. Every field is checked: nothing from the
-   * client reaches a command line unchecked.
+   * The adapter's address, MTU, priority and DNS, a route to the gateway through the network it is reached by now (so
+   * the encrypted packets themselves do not loop into the tunnel), and the tunnel's networks. "All traffic" is two
+   * halves, 0.0.0.0/1 and 128.0.0.0/1: more specific than any default route, whatever its metric.
+   */
+  static void Configure(TunConfig c) {
+    ForwardRow best;
+    if (GetBestRoute(ToAddr(c.Gateway), 0, out best) == 0 && best.NextHop != 0 && best.IfIndex != c.Index) {
+      c.GatewayNextHop = FromAddr(best.NextHop);
+      c.GatewayIf = best.IfIndex;
+      Netsh("interface ipv4 add route prefix=" + c.Gateway + "/32 interface=" + c.GatewayIf + " nexthop=" + c.GatewayNextHop + " metric=1 store=active");
+    }
+    Netsh("interface ipv4 set address name=" + c.Index + " source=static address=" + c.Address + " mask=" + c.Netmask);
+    Netsh("interface ipv4 set subinterface " + c.Index + " mtu=" + c.Mtu + " store=active");
+    Netsh("interface ipv4 set interface " + c.Index + " metric=1 store=active");
+    if (c.Dns.Count > 0) {
+      Netsh("interface ipv4 set dnsservers name=" + c.Index + " source=static address=" + c.Dns[0] + " register=none validate=no");
+      for (int i = 1; i < c.Dns.Count; i++) Netsh("interface ipv4 add dnsservers name=" + c.Index + " address=" + c.Dns[i] + " index=" + (i + 1) + " validate=no");
+    }
+    foreach (string[] r in c.Routes) Netsh("interface ipv4 add route prefix=" + r[0] + "/" + r[1] + " interface=" + c.Index + " nexthop=0.0.0.0 metric=1 store=active");
+  }
+
+  /** Everything Configure did, undone; the adapter itself stays for the next connection. */
+  static void Unconfigure(TunConfig c) {
+    foreach (string[] r in c.Routes) Netsh("interface ipv4 delete route prefix=" + r[0] + "/" + r[1] + " interface=" + c.Index + " nexthop=0.0.0.0 store=active");
+    if (c.GatewayNextHop != null) Netsh("interface ipv4 delete route prefix=" + c.Gateway + "/32 interface=" + c.GatewayIf + " nexthop=" + c.GatewayNextHop + " store=active");
+    Netsh("interface ipv4 set dnsservers name=" + c.Index + " source=static address=none validate=no");
+    Netsh("interface ipv4 delete address name=" + c.Index + " address=" + c.Address);
+  }
+
+  /**
+   * The adapter, created once and kept while the helper runs: creating it again right after Windows removed the last
+   * one can take a long time or fail. Its own name, so OpenConnect's "FortiConnect" adapter for SSL-VPN never meets it.
+   */
+  static IntPtr ipsecAdapter = IntPtr.Zero;
+  static uint ipsecIndex;
+
+  static void OpenAdapter() {
+    if (ipsecAdapter != IntPtr.Zero) return;
+    string dir = Path.Combine(home ?? "", "openconnect");
+    if (LoadLibraryW(Path.Combine(dir, "wintun.dll")) == IntPtr.Zero) throw new Exception("wintun.dll could not be loaded from " + dir);
+    IntPtr a = WintunOpenAdapter("FortiConnect IPsec");
+    if (a == IntPtr.Zero) a = WintunCreateAdapter("FortiConnect IPsec", "FortiConnect", IntPtr.Zero);
+    if (a == IntPtr.Zero) throw new Exception("Could not create the VPN adapter (error " + Marshal.GetLastWin32Error() + ")");
+    ulong luid;
+    WintunGetAdapterLUID(a, out luid);
+    ConvertInterfaceLuidToIndex(ref luid, out ipsecIndex);
+    ipsecAdapter = a;
+  }
+
+  /**
+   * Open the IPsec adapter, give it the address, routes and DNS the gateway handed out, and carry packets between it and
+   * the client until the client closes the pipe; then undo the setup. Every field is checked: nothing from the client
+   * reaches a command line unchecked.
    */
   static void RunTun(Dictionary<string, object> m, Conn conn, Stream pipe) {
-    string address = Need(Str(m, "address"), IPV4, "address");
-    string netmask = Str(m, "netmask");
-    if (string.IsNullOrEmpty(netmask)) netmask = "255.255.255.255";
-    Need(netmask, IPV4, "netmask");
-    string gateway = Need(Str(m, "gateway"), IPV4, "gateway");
-    List<string> dns = new List<string>();
-    foreach (string d in (Str(m, "dns") ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)) dns.Add(Need(d, IPV4, "DNS server"));
-    if (dns.Count > 4) throw new Exception("Too many DNS servers");
-    List<string[]> split = new List<string[]>();
+    TunConfig c = new TunConfig();
+    c.Address = Need(Str(m, "address"), IPV4, "address");
+    c.Netmask = Str(m, "netmask");
+    if (string.IsNullOrEmpty(c.Netmask)) c.Netmask = "255.255.255.255";
+    Need(c.Netmask, IPV4, "netmask");
+    c.Gateway = Need(Str(m, "gateway"), IPV4, "gateway");
+    foreach (string d in (Str(m, "dns") ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)) c.Dns.Add(Need(d, IPV4, "DNS server"));
+    if (c.Dns.Count > 4) throw new Exception("Too many DNS servers");
     foreach (string net in (Str(m, "split") ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries)) {
       string[] parts = net.Split('/');
       if (parts.Length != 2) throw new Exception("Invalid network");
       Need(parts[0], IPV4, "network");
       int len = int.Parse(Need(parts[1], @"^[0-9]{1,2}$", "prefix length"));
       if (len > 32) throw new Exception("Invalid prefix length");
-      split.Add(new[] { parts[0], MaskOf(len), len.ToString() });
+      c.Routes.Add(new[] { parts[0], len.ToString() });
     }
-    if (split.Count > 100) throw new Exception("Too many networks");
-    int mtu = int.Parse(Need(Str(m, "mtu") ?? "1400", @"^[0-9]{3,4}$", "MTU"));
-    if (mtu < 576 || mtu > 1500) throw new Exception("Invalid MTU");
+    if (c.Routes.Count > 100) throw new Exception("Too many networks");
+    if (c.Routes.Count == 0) {
+      c.Routes.Add(new[] { "0.0.0.0", "1" });
+      c.Routes.Add(new[] { "128.0.0.0", "1" });
+    }
+    c.Mtu = int.Parse(Need(Str(m, "mtu") ?? "1400", @"^[0-9]{3,4}$", "MTU"));
+    if (c.Mtu < 576 || c.Mtu > 1500) throw new Exception("Invalid MTU");
     // Test mode: no adapter and no setup, packets come straight back.
     bool echo = testCommand == "tun-echo";
 
@@ -311,41 +381,18 @@ public static class FcHelper {
       if (tunActive || (current != null && !current.HasExited)) throw new Exception("Another FortiConnect connection is already running through the helper");
       tunActive = true;
     }
-    string dir = Path.Combine(home ?? "", "openconnect");
-    IntPtr adapter = IntPtr.Zero;
     IntPtr session = IntPtr.Zero;
-    Dictionary<string, string> env = null;
+    bool configured = false;
     bool stop = false;
     Thread fromAdapter = null;
     try {
-      uint index = 0;
       if (!echo) {
-        if (LoadLibraryW(Path.Combine(dir, "wintun.dll")) == IntPtr.Zero) throw new Exception("wintun.dll could not be loaded from " + dir);
-        adapter = WintunOpenAdapter("FortiConnect");
-        if (adapter == IntPtr.Zero) adapter = WintunCreateAdapter("FortiConnect", "FortiConnect", IntPtr.Zero);
-        if (adapter == IntPtr.Zero) throw new Exception("Could not create the VPN adapter (error " + Marshal.GetLastWin32Error() + ")");
-        ulong luid;
-        WintunGetAdapterLUID(adapter, out luid);
-        ConvertInterfaceLuidToIndex(ref luid, out index);
-        session = WintunStartSession(adapter, 0x400000);
+        OpenAdapter();
+        c.Index = ipsecIndex;
+        session = WintunStartSession(ipsecAdapter, 0x400000);
         if (session == IntPtr.Zero) throw new Exception("Could not start the VPN adapter (error " + Marshal.GetLastWin32Error() + ")");
-        env = new Dictionary<string, string>();
-        env["TUNDEV"] = "FortiConnect";
-        env["TUNIDX"] = index.ToString();
-        env["VPNGATEWAY"] = gateway;
-        env["INTERNAL_IP4_ADDRESS"] = address;
-        env["INTERNAL_IP4_NETMASK"] = netmask;
-        env["INTERNAL_IP4_MTU"] = mtu.ToString();
-        if (dns.Count > 0) env["INTERNAL_IP4_DNS"] = string.Join(" ", dns.ToArray());
-        if (split.Count > 0) {
-          env["CISCO_SPLIT_INC"] = split.Count.ToString();
-          for (int i = 0; i < split.Count; i++) {
-            env["CISCO_SPLIT_INC_" + i + "_ADDR"] = split[i][0];
-            env["CISCO_SPLIT_INC_" + i + "_MASK"] = split[i][1];
-            env["CISCO_SPLIT_INC_" + i + "_MASKLEN"] = split[i][2];
-          }
-        }
-        RunScript("connect", env, dir);
+        configured = true;
+        Configure(c);
         IntPtr readEvent = WintunGetReadWaitEvent(session);
         IntPtr sess = session;
         fromAdapter = new Thread(() => {
@@ -367,8 +414,8 @@ public static class FcHelper {
         fromAdapter.IsBackground = true;
         fromAdapter.Start();
       }
-      Log("tun up: " + address + (split.Count > 0 ? " (" + split.Count + " networks)" : " (all traffic)"));
-      conn.Send("tun-ready", "index", (int)index);
+      Log("tun up: " + c.Address + " on interface " + c.Index + ", routes " + c.Routes.Count + (c.GatewayNextHop != null ? ", gateway via " + c.GatewayNextHop : ""));
+      conn.Send("tun-ready", "index", (int)c.Index);
       byte[] head = new byte[2];
       byte[] packet = new byte[65535];
       while (ReadFull(pipe, head, 2)) {
@@ -383,9 +430,8 @@ public static class FcHelper {
     } finally {
       stop = true;
       if (fromAdapter != null) fromAdapter.Join(2000);
-      if (env != null) { try { RunScript("disconnect", env, dir); } catch (Exception e) { Log("vpnc-script disconnect: " + e.Message); } }
+      if (configured) { try { Unconfigure(c); } catch (Exception e) { Log("unconfigure: " + e.Message); } }
       if (session != IntPtr.Zero) WintunEndSession(session);
-      if (adapter != IntPtr.Zero) WintunCloseAdapter(adapter);
       lock (busy) { tunActive = false; }
       Log("tun down");
     }

@@ -1,9 +1,30 @@
 # Status
 
-Released: 0.5.0 (tag v0.5.0, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
+Released: 0.5.1 (tag v0.5.1, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.5.0, 0.4.0, 0.3.2 and 0.3.1 (the same day), then 0.3.0, 0.2.0, 0.1.1 and
 0.1.0 (the first release), all on 2026-10-25. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
+
+## In 0.5.1: the IPsec adapter set up by the helper itself
+
+The user's test of 0.5.0 (2026-10-26): it connected, but nothing behind the VPN was reachable, and reconnecting hung at
+"Setting up the VPN adapter". Seen on their PC while connected: the adapter had only 169.254.x (netsh "set address"
+failed with "The object already exists": the last connection's address and default route were still there), no route
+into the tunnel (Ethernet and the tunnel both had metric 1; `Find-NetRoute 192.168.57.16` chose Ethernet), 0 bytes
+received on the adapter. vpnc-script also took up to a minute on a reused adapter.
+
+- **Helper v5** no longer uses vpnc-script for IPsec. It keeps its own adapter, "FortiConnect IPsec", for as long as it
+  runs (no delete and re-create between connections), and sets it up with single netsh commands built from checked
+  values: the address (`set address` replaces leftovers), MTU, interface metric 1, DNS, a /32 route to the gateway
+  through the route Windows uses for it now (GetBestRoute), and the tunnel's networks as on-link routes; "all
+  traffic" is 0.0.0.0/1 + 128.0.0.0/1, which beat any default route. Disconnect deletes exactly those.
+- The engine asks for INTERNAL_IP4_SUBNET in mode config and routes only those networks when the FortiGate names them
+  (FortiClient does the same); a /0 there means all traffic.
+- 15 s after connecting the log says how many packets went out and came back, and warns when none came back.
+- **Checked on the user's PC** with helper v5 installed and a harmless setup (10.255.255.0/24, gateway 192.0.2.1): up in
+  ~3 s, address and MTU set, gateway route via Ethernet, 10.255.255.9 routed into the adapter and 8.8.8.8 not, and all
+  of it removed again on disconnect. **Not checked:** traffic through the real gateway, and the all-traffic halves (that
+  test would have cut the PC's own traffic).
 
 ## In 0.5.0: IPsec IKEv2 carries traffic (step 2 of 3)
 

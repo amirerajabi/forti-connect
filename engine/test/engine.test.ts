@@ -777,6 +777,7 @@ describe('IKEv2 engine', () => {
     assert.equal(result.address, '10.212.134.5');
     assert.deepEqual(result.dns, ['10.0.0.53']);
     assert.deepEqual(result.networks, [{ start: '10.0.0.0', end: '10.255.255.255' }]);
+    assert.deepEqual(result.subnets, ['192.168.57.0/24']);
     assert.ok(result.udpEncapsulation);
     // Both ends derived the same ESP keys, and each knows the other's SPI.
     assert.ok(result.child.spiOut.equals(g.seen.childSpiIn!));
@@ -879,8 +880,9 @@ describe('IPsec traffic (ESP)', () => {
       const c = await m.connect(p.id);
       assert.equal(c.status, 'connected');
       assert.equal(c.address, '10.212.134.5');
-      assert.equal(c.device, 'FortiConnect');
-      assert.deepEqual(t.setup(), { address: '10.212.134.5', netmask: null, dns: ['10.0.0.53'], gateway: '127.0.0.1', split: ['10.0.0.0/8'], mtu: 1400 });
+      assert.equal(c.device, 'FortiConnect IPsec');
+      // The networks the gateway names in mode config (its split tunnel) win over its traffic selector.
+      assert.deepEqual(t.setup(), { address: '10.212.134.5', netmask: null, dns: ['10.0.0.53'], gateway: '127.0.0.1', split: ['192.168.57.0/24'], mtu: 1400 });
       // A packet from the computer reaches the gateway, and the gateway's answer reaches the computer.
       const packet = Buffer.alloc(84, 9);
       packet[0] = 0x45;

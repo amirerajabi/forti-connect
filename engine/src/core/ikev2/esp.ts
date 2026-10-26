@@ -30,6 +30,8 @@ export class Esp {
   private readonly icvLength: number;
   /** Bytes of inner packets each way, for the traffic counters. */
   bytesOut = 0;
+  packetsOut = 0;
+  packetsIn = 0;
   bytesIn = 0;
 
   constructor(private readonly k: EspKeys) {
@@ -57,6 +59,7 @@ export class Esp {
     const unsigned = Buffer.concat([head, iv, ct]);
     const icv = createHmac(this.hash, this.k.integOut).update(unsigned).digest().subarray(0, this.icvLength);
     this.bytesOut += packet.length;
+    this.packetsOut++;
     return Buffer.concat([unsigned, icv]);
   }
 
@@ -88,6 +91,7 @@ export class Esp {
     if (next !== NEXT_IPV4) throw new EspError(`ESP carries next header ${next}, not IPv4`);
     const inner = plain.subarray(0, plain.length - 2 - padLen);
     this.bytesIn += inner.length;
+    this.packetsIn++;
     return inner;
   }
 

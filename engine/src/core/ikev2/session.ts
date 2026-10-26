@@ -94,6 +94,8 @@ export interface IkeResult {
   dns: string[];
   /** Networks the gateway sends through the tunnel (its TSr); 0.0.0.0-255.255.255.255 means everything. */
   networks: TrafficSelector[];
+  /** The company networks a FortiGate names in mode config (INTERNAL_IP4_SUBNET, its split tunnel), as "a.b.c.d/len". */
+  subnets: string[];
   child: ChildSa;
   /** Where ESP goes: the gateway's address and port, and whether it travels inside UDP (NAT traversal). */
   remote: { address: string; port: number };
@@ -498,7 +500,7 @@ export class IkeSession {
     let ps = await this.exchange([
       { type: PAYLOAD.IDi, critical: false, body: this.idiBody },
       { type: PAYLOAD.NOTIFY, critical: false, body: encodeNotify({ type: NOTIFY.INITIAL_CONTACT }) },
-      { type: PAYLOAD.CP, critical: false, body: encodeCp(CFG_REQUEST, [CP_ATTR.INTERNAL_IP4_ADDRESS, CP_ATTR.INTERNAL_IP4_NETMASK, CP_ATTR.INTERNAL_IP4_DNS].map((type) => ({ type, value: Buffer.alloc(0) }))) },
+      { type: PAYLOAD.CP, critical: false, body: encodeCp(CFG_REQUEST, [CP_ATTR.INTERNAL_IP4_ADDRESS, CP_ATTR.INTERNAL_IP4_NETMASK, CP_ATTR.INTERNAL_IP4_DNS, CP_ATTR.INTERNAL_IP4_SUBNET].map((type) => ({ type, value: Buffer.alloc(0) }))) },
       { type: PAYLOAD.SA, critical: false, body: encodeSa([this.espProposal(spiIn)]) },
       { type: PAYLOAD.TSi, critical: false, body: encodeTs(all) },
       { type: PAYLOAD.TSr, critical: false, body: encodeTs(all) },
@@ -530,6 +532,12 @@ export class IkeSession {
     const cp = ps.find((p) => p.type === PAYLOAD.CP);
     const cfg = cp ? decodeCp(cp.body) : null;
     const attr = (t: number) => (cfg?.cfgType === CFG_REPLY ? cfg.attrs.filter((a) => a.type === t && a.value.length >= 4).map((a) => ip4s(a.value.subarray(0, 4))) : []);
+    // INTERNAL_IP4_SUBNET: address then netmask (RFC 7296 §3.15.1); FortiClient routes these, as a split tunnel.
+    const subnets = cfg?.cfgType === CFG_REPLY
+      ? cfg.attrs
+          .filter((a) => a.type === CP_ATTR.INTERNAL_IP4_SUBNET && a.value.length >= 8)
+          .map((a) => `${ip4s(a.value.subarray(0, 4))}/${[...a.value.subarray(4, 8)].reduce((n, b) => n + ((b >>> 0).toString(2).match(/1/g)?.length ?? 0), 0)}`)
+      : [];
     const address = attr(CP_ATTR.INTERNAL_IP4_ADDRESS)[0];
     if (!address) throw new IkeError('The FortiGate did not give this computer a VPN address');
     const sa = ps.find((p) => p.type === PAYLOAD.SA);
@@ -549,6 +557,7 @@ export class IkeSession {
       netmask: attr(CP_ATTR.INTERNAL_IP4_NETMASK)[0] ?? null,
       dns: attr(CP_ATTR.INTERNAL_IP4_DNS),
       networks,
+      subnets,
       child: { spiOut: Buffer.from(chosen.spi), spiIn, suite: espSuite, ...k },
       remote: { address: this.remoteAddress, port: this.remotePort },
       udpEncapsulation: this.natT,

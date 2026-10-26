@@ -241,7 +241,7 @@ export async function startFakeGateway(o: FakeGatewayOptions): Promise<FakeGatew
       esp = new Esp({ spiOut: espProposalSpi, spiIn: spiOurs, suite: espSuite, encrOut: ck.encrIn, integOut: ck.integIn, encrIn: ck.encrOut, integIn: ck.integOut });
       return send([
         { type: PAYLOAD.AUTH, critical: false, body: encodeAuth(AUTH_SHARED_KEY, authValue(suite.prf!, msk!, initResponse, ni, keys.skPr, idrBody)) },
-        { type: PAYLOAD.CP, critical: false, body: encodeCp(CFG_REPLY, [{ type: CP_ATTR.INTERNAL_IP4_ADDRESS, value: ip4('10.212.134.5') }, { type: CP_ATTR.INTERNAL_IP4_DNS, value: ip4('10.0.0.53') }]) },
+        { type: PAYLOAD.CP, critical: false, body: encodeCp(CFG_REPLY, [{ type: CP_ATTR.INTERNAL_IP4_ADDRESS, value: ip4('10.212.134.5') }, { type: CP_ATTR.INTERNAL_IP4_DNS, value: ip4('10.0.0.53') }, { type: CP_ATTR.INTERNAL_IP4_SUBNET, value: Buffer.concat([ip4('192.168.57.0'), ip4('255.255.255.0')]) }]) },
         { type: PAYLOAD.SA, critical: false, body: encodeSa([{ number: 1, protocol: PROTOCOL.ESP, spi: spiOurs, transforms: [{ type: TRANSFORM.ENCR, id: ENCR_AES_CBC, keyLength: 256 }, { type: TRANSFORM.INTEG, id: espIntegId }, { type: TRANSFORM.ESN, id: 0 }] }]) },
         { type: PAYLOAD.TSi, critical: false, body: encodeTs([{ start: '10.212.134.5', end: '10.212.134.5' }]) },
         { type: PAYLOAD.TSr, critical: false, body: encodeTs([{ start: '10.0.0.0', end: '10.255.255.255' }]) },

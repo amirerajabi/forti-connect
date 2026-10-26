@@ -11,8 +11,8 @@ import { errorMessage } from '../util';
 import { helperTun, type HelperTun, type TunSetup } from './helper';
 import type { Leftover, PromptRequest, Tunnel, TunnelHooks, TunnelUp } from './types';
 
-/** The adapter's name: the helper always opens "FortiConnect", as OpenConnect does for SSL-VPN. */
-export const IKEV2_ADAPTER = 'FortiConnect';
+/** The helper's own adapter for IPsec, kept between connections (OpenConnect's for SSL-VPN is "FortiConnect"). */
+export const IKEV2_ADAPTER = 'FortiConnect IPsec';
 /** ESP in UDP costs up to ~90 bytes per packet; 1400 keeps packets whole on any 1500-byte path. */
 const MTU = 1400;
 
@@ -65,6 +65,7 @@ export class Ikev2Tunnel implements Tunnel {
   private up = false;
   /** Packets dropped on the way in (failed integrity, replays), for the log. */
   private dropped = 0;
+  private report: NodeJS.Timeout | null = null;
 
   constructor(private readonly o: Ikev2Options) {}
 
@@ -100,7 +101,9 @@ export class Ikev2Tunnel implements Tunnel {
       const r = await session.connect();
       if (this.stopping) throw new Error('Cancelled');
       // The profile's own networks win over what the gateway offered (FortiClient's split tunnel lives on the gateway).
-      const split = p.routes?.length ? p.routes.map((n) => (n.includes('/') ? n : `${n}/32`)) : rangesToNetworks(r.networks);
+      // The profile's own networks first, then the ones the FortiGate names (its split tunnel), then what TSr allows.
+      if (r.subnets.length) this.log(`The FortiGate names these networks: ${r.subnets.join(', ')}`);
+      const split = p.routes?.length ? p.routes.map((n) => (n.includes('/') ? n : `${n}/32`)) : r.subnets.length ? (r.subnets.some((n) => n.endsWith('/0')) ? [] : r.subnets) : rangesToNetworks(r.networks);
       const setup: TunSetup = { address: r.address, netmask: r.netmask, dns: r.dns.slice(0, 4), gateway: r.remote.address, split, mtu: MTU };
       this.log(`Setting up the VPN adapter: ${r.address}${split.length ? `, networks ${split.join(', ')}` : ', all traffic'}${r.dns.length ? `, DNS ${r.dns.join(', ')}` : ''}`);
       const tun = this.o.tun ? this.o.tun(setup) : helperTun(setup, this.o.helperPipe);
@@ -126,6 +129,12 @@ export class Ikev2Tunnel implements Tunnel {
       });
       tun.onClosed((reason) => reason && this.lost(reason));
       this.up = true;
+      // Whether the gateway answers at all shows quickly: say so in the log, where it helps most when pages do not load.
+      this.report = setTimeout(() => {
+        if (!this.up) return;
+        const line = `Traffic after 15 s: ${esp.packetsOut} packets sent, ${esp.packetsIn} received from the FortiGate${this.dropped ? `, ${this.dropped} dropped` : ''}`;
+        this.log(esp.packetsOut > 0 && esp.packetsIn === 0 ? `${line}. The FortiGate has not answered any traffic yet.` : line, esp.packetsOut > 0 && esp.packetsIn === 0 ? 'warning' : 'info');
+      }, 15_000);
       return { device: IKEV2_ADAPTER, address: r.address };
     } catch (e) {
       this.tun?.close();
@@ -150,6 +159,7 @@ export class Ikev2Tunnel implements Tunnel {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    if (this.report) clearTimeout(this.report);
     this.up = false;
     // The helper first: it undoes the routes and DNS, so the computer has its own network back before the tunnel goes.
     this.tun?.close();
