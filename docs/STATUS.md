@@ -1,11 +1,11 @@
 # Status
 
-Released: 0.3.0 (tag v0.3.0, 2026-10-25), at https://github.com/amirerajabi/forti-connect. Before it: 0.2.0, 0.1.1 and
-0.1.0 (the first release), the same day. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
+Released: 0.3.1 (tag v0.3.1, 2026-10-26), at https://github.com/amirerajabi/forti-connect. Before it: 0.3.0, 0.2.0, 0.1.1 and
+0.1.0 (the first release), all on 2026-10-25. The release workflow builds the Windows installer, the macOS DMG / ZIP and the
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
 
-## Unreleased (after 0.3.0)
+## In 0.3.1
 
 From the user's log of a network drop against their real FortiGate (2026-10-26):
 
