@@ -5,7 +5,7 @@ import type { EngineEvent, EngineState, ProfileInput, Settings } from '../../../
 import type { Manager } from '../core/Manager';
 import { errorMessage } from '../core/util';
 
-export const ENGINE_VERSION = '0.3.1';
+export const ENGINE_VERSION = '0.3.2';
 
 type Handler = (ctx: { body: any; params: Record<string, string> }) => Promise<unknown> | unknown;
 
