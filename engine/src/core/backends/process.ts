@@ -26,6 +26,10 @@ export interface Dialect {
   adminRefused?(line: string): boolean;
   /** The log level for a line whose words mislead (a "failed" that is not a failure); undefined: judge by its words. */
   level?(line: string): LogLine['level'] | undefined;
+  /** A line saying the gateway will not let this session resume after a drop (a fresh login is the only way back). */
+  noResume?(line: string): boolean;
+  /** A line saying the running program lost the gateway and is trying to get it back. */
+  lost?(line: string): boolean;
 }
 
 /** A running VPN program as ProcessTunnel sees it: a child process of ours, or one the VPN helper runs for us. */
@@ -107,6 +111,8 @@ export class ProcessTunnel implements Tunnel {
   private used = { password: false, psk: false, admin: false };
   private info: TunnelUp = { device: null, address: null };
   private recent: string[] = [];
+  /** The gateway said a dropped session cannot resume. */
+  private noResume = false;
 
   constructor(private readonly s: ProcessSpec) {}
 
@@ -215,6 +221,13 @@ export class ProcessTunnel implements Tunnel {
     if (p?.up && !this.up) {
       this.up = true;
       this.onUp();
+    }
+    if (d.noResume?.(text)) this.noResume = true;
+    // The program would keep trying to resume for minutes (OpenConnect: 5), which this gateway refuses anyway. End it
+    // now and report the drop, so the Manager logs in again as soon as the gateway answers.
+    if (this.up && this.noResume && !this.stopping && d.lost?.(text)) {
+      const message = `${d.name} lost the gateway, which does not let a session resume: logging in again`;
+      void this.stop().then(() => this.s.hooks.dropped(message));
     }
   }
 

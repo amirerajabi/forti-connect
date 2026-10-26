@@ -17,7 +17,7 @@
 import { gzipSync } from 'node:zlib';
 
 /** Bump when the helper changes: an older one installed on a computer is offered as an update. */
-export const HELPER_VERSION = 2;
+export const HELPER_VERSION = 3;
 export const HELPER_PIPE = '\\\\.\\pipe\\forticonnect-helper';
 export const HELPER_TASK = 'FortiConnect VPN helper';
 export const HELPER_DIR_NAME = 'FortiConnect Helper';
@@ -28,6 +28,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
@@ -55,6 +56,9 @@ public static class FcHelper {
       try { allowed.Add(new SecurityIdentifier(s.Trim())); } catch (Exception e) { Log("bad SID " + s + ": " + e.Message); }
     }
     if (allowed.Count == 0) allowed.Add(WindowsIdentity.GetCurrent().User);
+    // A process started with Ctrl+C ignored passes that on to every program it starts, and OpenConnect would then
+    // never hear the Ctrl+C that ends it cleanly (see End). Whoever started the helper may have set it: clear it.
+    SetConsoleCtrlHandler(IntPtr.Zero, false);
     Log("helper " + Version + " started, pipe " + pipeName);
     // Several pipe instances wait at once: a connection being served (a tunnel can last hours) never leaves the next
     // client without one to open.
@@ -153,12 +157,47 @@ public static class FcHelper {
     } finally {
       // The client is gone or asked to stop: end its tunnel.
       if (mine != null) {
-        try { if (!mine.HasExited) mine.Kill(); } catch { }
-        try { mine.WaitForExit(5000); } catch { }
+        End(mine);
         lock (busy) { if (current == mine) current = null; }
       }
       if (certFile != null) try { File.Delete(certFile); } catch { }
       try { pipe.Dispose(); } catch { }
+    }
+  }
+
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint group);
+
+  // Ctrl+C first: OpenConnect then logs out, runs its script's "disconnect" (removing the gateway route) and deletes
+  // its Wintun adapter. Killed outright it leaves that adapter half-removed, and the next OpenConnect fails to open it
+  // ("Could not open Wintun adapter"): every connect after a disconnect needed a second try. Killed only if Ctrl+C does
+  // not end it in time (a logout to a gateway that cannot be reached).
+  static void End(Process p) {
+    try { if (p.HasExited) return; } catch { return; }
+    bool interrupted = false;
+    // The helper has one console at a time, and a program started while it ignores Ctrl+C would inherit that: hold
+    // the same lock Start does.
+    lock (busy) {
+      try {
+        FreeConsole();
+        if (AttachConsole((uint)p.Id)) {
+          SetConsoleCtrlHandler(IntPtr.Zero, true);
+          interrupted = GenerateConsoleCtrlEvent(0, 0);
+          // The event reaches every process on that console, the helper too: keep ignoring it until it has passed.
+          Thread.Sleep(300);
+          FreeConsole();
+          SetConsoleCtrlHandler(IntPtr.Zero, false);
+        }
+      } catch (Exception e) { Log("ctrl+c: " + e.Message); }
+    }
+    bool ended = false;
+    try { ended = interrupted && p.WaitForExit(8000); } catch { }
+    if (!ended) {
+      Log(interrupted ? "did not end after Ctrl+C, killing it" : "could not send Ctrl+C, killing it");
+      try { if (!p.HasExited) p.Kill(); } catch { }
+      try { p.WaitForExit(5000); } catch { }
     }
   }
 

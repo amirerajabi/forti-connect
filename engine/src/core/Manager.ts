@@ -23,7 +23,7 @@ import { createTunnel, detectBackends, type TunnelFactory } from './backends';
 import { installHelper, removeHelper } from './backends/helper';
 import { disconnectRas } from './backends/ras';
 import type { Leftover, PromptRequest, Tunnel } from './backends/types';
-import { checkGateway } from './net';
+import { checkGateway, tcpPing } from './net';
 import { buildLink, normalizeConfig, normalizeInput, parseLinks, profileKey } from './profiles';
 import { SecretStore, secretKey } from './secrets';
 import { BACKEND_KEYS, defaultSettings, mergeSettings } from './settings';
@@ -64,10 +64,15 @@ export interface ManagerOptions {
   checkCertificates?: boolean;
   /** The Windows VPN helper's pipe (tests run their own helper). */
   helperPipe?: string;
+  /** Does the SSL-VPN gateway answer (tests decide); default: a TCP connection to its port. */
+  gatewayReachable?: (host: string, port: number) => Promise<boolean>;
+  /** How often to look again while the gateway does not answer, in ms (tests make it short). */
+  networkPollMs?: number;
 }
 
 const EMPTY_TRAFFIC: Traffic = { up: 0, down: 0, totalUp: 0, totalDown: 0 };
-const IDLE: ConnectionState = { status: 'disconnected', profileId: null, since: null, address: null, device: null, prompt: null };
+// waitingForNetwork is listed so that spreading IDLE into a state update clears it.
+const IDLE: ConnectionState = { status: 'disconnected', profileId: null, since: null, address: null, device: null, prompt: null, waitingForNetwork: undefined };
 
 export class Manager extends EventEmitter {
   private settings: Settings = defaultSettings();
@@ -88,6 +93,8 @@ export class Manager extends EventEmitter {
   private lastCounters: (Counters & { at: number }) | null = null;
   private firstCounters: Counters | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** Bumped when reconnecting is cancelled, so a gateway check still under way does not connect afterwards. */
+  private waitToken = 0;
   private retry = 0;
   /** Resets the attempt count once a connection has stayed up: a tunnel that keeps dropping must not retry forever. */
   private stableTimer: NodeJS.Timeout | null = null;
@@ -614,8 +621,33 @@ export class Manager extends EventEmitter {
     this.setConnection({ retry: attempt });
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.queue(() => this.doConnect(profileId)).catch(() => undefined);
+      void this.reconnectWhenReachable(profileId, this.waitToken);
     }, wait * 1000);
+  }
+
+  /**
+   * Connect again once the gateway answers. While it does not (the network is down), look again every few seconds
+   * without using up an attempt: an outage of any length ends in a connection, and only real failures count.
+   * IPsec gateways answer on UDP, which cannot be checked this way: they are tried straight away.
+   */
+  private async reconnectWhenReachable(profileId: string, token: number): Promise<void> {
+    const p = this.profiles.find((x) => x.id === profileId);
+    if (p?.type === 'ssl') {
+      const reachable = this.opts.gatewayReachable ?? (async (host: string, port: number) => (await tcpPing(host, port, 4000)) >= 0);
+      const ok = await reachable(p.gateway, p.port).catch(() => false);
+      if (token !== this.waitToken) return; // cancelled while looking
+      if (!ok) {
+        if (!this.connection.waitingForNetwork) this.log('app', `Waiting for the network: ${p.gateway}:${p.port} does not answer`);
+        this.setConnection({ waitingForNetwork: true });
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null;
+          void this.reconnectWhenReachable(profileId, token);
+        }, this.opts.networkPollMs ?? 3000);
+        return;
+      }
+      if (this.connection.waitingForNetwork) this.log('app', `${p.gateway}:${p.port} answers again`);
+    }
+    void this.queue(() => this.doConnect(profileId)).catch(() => undefined);
   }
 
   private markStable(): void {
@@ -632,7 +664,8 @@ export class Manager extends EventEmitter {
     this.stableTimer = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    if (this.connection.retry) this.setConnection({ retry: undefined });
+    this.waitToken++;
+    if (this.connection.retry || this.connection.waitingForNetwork) this.setConnection({ retry: undefined, waitingForNetwork: undefined });
   }
 
   // ------------------------------------------------- crash repair (runtime.json)

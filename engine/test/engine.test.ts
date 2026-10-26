@@ -246,7 +246,7 @@ const BACKENDS: Backends = {
   platform: 'linux',
 };
 
-async function fakeManager(mode: string, extra: { reconnect?: boolean; checkCertificates?: boolean } = {}) {
+async function fakeManager(mode: string, extra: { reconnect?: boolean; checkCertificates?: boolean; reachable?: () => boolean } = {}) {
   const dir = tmpDir();
   /** The profiles the tunnel was made for, as the backend saw them (with the certificate pin to pass on). */
   const started: Profile[] = [];
@@ -257,6 +257,8 @@ async function fakeManager(mode: string, extra: { reconnect?: boolean; checkCert
     secretKey: KEY,
     reconnectDelays: [0.05],
     checkCertificates: extra.checkCertificates ?? false,
+    gatewayReachable: async () => extra.reachable?.() ?? true,
+    networkPollMs: 50,
     tunnelFactory: (ctx) => {
       started.push(ctx.profile);
       return new ProcessTunnel({ file: process.execPath, args: [FAKE_VPN, mode], username: ctx.profile.username, secrets: ctx.secrets, dialect: openconnectDialect, hooks: ctx.hooks, names: ['node'], stopSignal: 'SIGINT', connectTimeoutMs: 15_000 });
@@ -377,6 +379,69 @@ describe('Manager', () => {
     assert.ok(events.some((e) => e.type === 'connection' && e.connection.retry === 1));
     assert.equal(m.state().connection.status, 'disconnected');
     assert.match(m.state().connection.error ?? '', /connection to the gateway lost/);
+    await m.shutdown();
+  });
+
+  test('a gateway that refuses to resume: a lost tunnel ends at once, waits for the network, then logs in again', async () => {
+    // The gateway "does not answer" for the first three looks after the drop.
+    let looks = 0;
+    const { m, events } = await fakeManager('lost', { reconnect: true, reachable: () => ++looks > 3 });
+    const p = m.addProfile({ name: 'Office', ...SSL, savePassword: true, password: 'secret' });
+    const first = m.connect(p.id);
+    m.answer((await nextPrompt(m)).id, '123456');
+    assert.equal((await first).status, 'connected');
+    // OpenConnect's reconnect loop starts; the engine ends it instead of waiting minutes, waits, then logs in again.
+    const again = await nextPrompt(m);
+    assert.equal(again.kind, 'otp');
+    assert.ok(m.state().logs.some((l) => /does not let a session resume: logging in again/.test(l.text)));
+    assert.ok(m.state().logs.some((l) => /Waiting for the network: vpn\.example\.com:10443 does not answer/.test(l.text)));
+    assert.ok(m.state().logs.some((l) => /answers again/.test(l.text)));
+    assert.ok(events.some((e) => e.type === 'connection' && e.connection.waitingForNetwork === true));
+    // Waiting for the network used up no attempts: this is still the first.
+    assert.equal(Math.max(...events.flatMap((e) => (e.type === 'connection' && e.connection.retry ? [e.connection.retry] : []))), 1);
+    assert.equal(looks, 4);
+    m.answer(again.id, '123456');
+    await new Promise<void>((resolve) => {
+      const check = () => m.state().connection.status === 'connected' && resolve();
+      m.on('event', check);
+      check();
+    });
+    assert.equal(m.state().connection.waitingForNetwork, undefined);
+    await m.disconnect();
+    await m.shutdown();
+  });
+
+  test('a gateway that allows resuming: OpenConnect is left to resume the session itself', async () => {
+    const { m } = await fakeManager('lost-resumable', { reconnect: true });
+    const p = m.addProfile({ name: 'Office', ...SSL, savePassword: true, password: 'secret' });
+    const first = m.connect(p.id);
+    m.answer((await nextPrompt(m)).id, '123456');
+    assert.equal((await first).status, 'connected');
+    await new Promise((r) => setTimeout(r, 1000));
+    assert.ok(m.state().logs.some((l) => /remaining timeout/.test(l.text)));
+    assert.equal(m.state().connection.status, 'connected');
+    await m.disconnect();
+    await m.shutdown();
+  });
+
+  test('disconnecting while waiting for the network stops waiting', async () => {
+    const { m } = await fakeManager('lost', { reconnect: true, reachable: () => false });
+    const p = m.addProfile({ name: 'Office', ...SSL, savePassword: true, password: 'secret' });
+    const first = m.connect(p.id);
+    m.answer((await nextPrompt(m)).id, '123456');
+    await first;
+    await new Promise<void>((resolve) => {
+      const check = () => m.state().connection.waitingForNetwork && resolve();
+      m.on('event', check);
+      check();
+    });
+    await m.disconnect();
+    const c = m.state().connection;
+    assert.equal(c.status, 'disconnected');
+    assert.equal(c.waitingForNetwork, undefined);
+    assert.equal(c.retry, undefined);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(m.state().connection.status, 'disconnected');
     await m.shutdown();
   });
 
@@ -530,6 +595,9 @@ describe('Windows VPN helper', { skip: process.platform !== 'win32' }, () => {
     assert.ok(m.state().logs.some((l) => l.text.includes('password=•••')));
     await m.disconnect();
     assert.equal(m.state().connection.status, 'disconnected');
+    // Ended with Ctrl+C (the fake answers it by logging out), not killed: OpenConnect cleans up its adapter that way.
+    assert.ok(m.state().logs.some((l) => l.text.includes('Logged out')), `the VPN program was not asked to stop. helper.log:\n${fs.readFileSync(path.join(dir, 'work', 'helper.log'), 'utf8')}`);
+    assert.doesNotMatch(fs.readFileSync(path.join(dir, 'work', 'helper.log'), 'utf8'), /killing it/);
     // One connection at a time, and the last one is gone: a new one may start.
     const again = m.connect(p.id);
     m.answer((await nextPrompt(m, 20_000)).id, '123456');

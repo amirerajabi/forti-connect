@@ -60,7 +60,11 @@ export function HomePage() {
           <h1>{t(TITLE[status])}</h1>
           {on && connection.since && <span className="conn-time tabular">{formatDuration(Date.now() - connection.since)}</span>}
         </div>
-        {status === 'connecting' && !!connection.retry && <span className="muted">{t('Reconnecting, attempt {n} of 5…', { n: connection.retry })}</span>}
+        {connection.waitingForNetwork ? (
+          <span className="muted">{t('Waiting for the network to come back…')}</span>
+        ) : (
+          status === 'connecting' && !!connection.retry && <span className="muted">{t('Reconnecting, attempt {n} of 5…', { n: connection.retry })}</span>
+        )}
 
         {profile ? (
           <button type="button" className="profile-pick" onClick={() => useUi.getState().go('profiles')} title={t('Choose another profile')}>

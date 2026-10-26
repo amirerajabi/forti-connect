@@ -103,6 +103,8 @@ export interface ConnectionState {
   error?: string;
   /** Reconnecting after the tunnel dropped: which attempt (1-based). */
   retry?: number;
+  /** Reconnecting, but the gateway does not answer yet: waiting for the network (this does not use up attempts). */
+  waitingForNetwork?: boolean;
 }
 
 export interface Traffic {

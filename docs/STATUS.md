@@ -5,6 +5,29 @@ Released: 0.3.0 (tag v0.3.0, 2026-10-25), at https://github.com/amirerajabi/fort
 Linux AppImage with their update metadata (for 0.1.0 and 0.1.1 the installer's SHA-512 matched `latest.yml`). The
 update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all users (see Known issues).
 
+## Unreleased (after 0.3.0)
+
+From the user's log of a network drop against their real FortiGate (2026-10-26):
+
+- **The FortiGate does not let a session resume** ("Server reports that reconnect-after-drop is not allowed"), yet
+  OpenConnect kept trying for up to 5 minutes after losing it, with the tunnel dead. When the gateway says so and
+  OpenConnect then reports it lost the gateway ("Failed to reconnect to host" / "remaining timeout"), the engine now ends
+  OpenConnect and logs in again itself. On a gateway that allows resuming, OpenConnect is left to resume (that keeps the
+  adapter and so the connections through it).
+- **Reconnecting waits for the network:** before each attempt the engine checks that the SSL-VPN gateway answers (TCP);
+  while it does not, it looks again every 3 s without using up one of the 5 attempts, and Home says "Waiting for the
+  network to come back…". IPsec is tried straight away as before (its gateway answers on UDP).
+- **Every connect after a disconnect failed once** ("Could not open Wintun adapter 'FortiConnect': Element not found",
+  then a second login 3 s later, sometimes with another VPN address). The helper killed OpenConnect, which left its
+  Wintun adapter half-removed (and skipped the logout and the script's route cleanup). **Helper v3** ends OpenConnect
+  with Ctrl+C (attaching to its console) and kills it only if it has not ended 8 s later; it also clears an inherited
+  "ignore Ctrl+C" flag at start, without which OpenConnect never heard it. Checked with the helper test (the fake VPN
+  logs out on Ctrl+C) — **not yet against the real OpenConnect / gateway**. OpenConnect run directly (FortiConnect
+  elevated, or macOS / Linux) is still ended as before.
+- Not solvable on this side: since the gateway refuses to resume, a real drop always means a new login, a new adapter,
+  and so broken TCP connections through the old one (a browser session to a server behind the VPN has to be reopened).
+  The gateway usually gives the same VPN address to a quick new login.
+
 ## In 0.3.0
 
 - **SSL-VPN connected and worked for the user through the helper** (FortiConnect 0.2.0, their real gateway, a full
@@ -54,7 +77,7 @@ update from 0.1.0 to 0.1.1 did install on the developer's machine, but for all u
 
 ## Works (verified on Windows, 2026-10-25)
 
-- `npm run typecheck`, `npm test` (30 engine tests), `npm run check:i18n` (237 strings) and `npm run build` pass.
+- `npm run typecheck`, `npm test` (42 engine tests), `npm run check:i18n` (256 strings) and `npm run build` pass.
 - The engine against a fake OpenConnect (`engine/test/fixtures/fake-vpn.mjs`): saved password answered automatically,
   FortiToken code asked through the UI, password asked and remembered when not saved, an untrusted certificate put to
   the user and its pin saved, a refused password reported in words, disconnecting while a question waits, a dropped

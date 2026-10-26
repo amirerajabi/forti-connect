@@ -12,6 +12,7 @@ export const FA: Record<string, string> = {
   'Connect to {name}': 'اتصال به {name}',
   'Connect / Disconnect': 'اتصال / قطع',
   'Reconnecting, attempt {n} of 5…': 'اتصال دوباره، تلاش {n} از ۵…',
+  'Waiting for the network to come back…': 'در انتظار برگشتن شبکه…',
   'Choose another profile': 'انتخاب پروفایل دیگر',
   'Add a profile first': 'اول یک پروفایل اضافه کنید',
   'Choose a profile first': 'اول یک پروفایل انتخاب کنید',

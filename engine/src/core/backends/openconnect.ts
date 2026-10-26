@@ -107,6 +107,11 @@ export const openconnectDialect: Dialect = {
   },
   level: (line) => (/Server certificate verify failed/i.test(line) ? 'info' : undefined),
   adminRefused: (line) => /Sorry, try again/i.test(line),
+  // FortiGate without "tunnel-connect-without-reauth": OpenConnect says so when it connects.
+  noResume: (line) => /reconnect-after-drop is not allowed/i.test(line),
+  // OpenConnect's own reconnect loop, once the gateway did not answer: "Failed to reconnect to host …" then
+  // "sleep 10s, remaining timeout 300s".
+  lost: (line) => /Failed to reconnect to host|remaining timeout \d+s/i.test(line),
   failure(last: string | undefined, code: number | null): string {
     const l = last ?? '';
     if (/incorrect password attempt|sudo:.*password/i.test(l)) return 'The computer password was not accepted, so the VPN adapter could not be set up';
